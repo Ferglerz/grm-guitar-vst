@@ -156,4 +156,25 @@ inline std::vector<Problem> impossible_moments(const Song& song, bool pick, bool
     return out;
 }
 
+// Would one more note be playable? Only the moments it touches are checked (its start and every start while it
+// rings), with only the notes and strums sounding then: the roll greys the places the hands cannot reach.
+inline bool playable_with(const Song& song, const RollNote& extra, bool pick, bool thumb = false) {
+    const double a = extra.start, b = extra.start + extra.length;
+    Song local;
+    local.bars = song.bars;
+    local.beats_per_bar = song.beats_per_bar;
+    for (const auto& n : song.notes)
+        if (n.start < b - 1e-9 && n.start + n.length > a + 1e-9) local.notes.push_back(n);
+    for (const auto& t : song.strums)
+        if (t.start < b - 1e-9 && t.start + t.length > a + 1e-9) local.strums.push_back(t);
+    auto inside = [&](const std::vector<Problem>& ps) {
+        int k = 0;
+        for (const auto& p : ps) k += p.beat >= a - 1e-9 && p.beat < b - 1e-9;
+        return k;
+    };
+    const int before = inside(impossible_moments(local, pick, thumb));
+    local.notes.push_back(extra);
+    return inside(impossible_moments(local, pick, thumb)) <= before;
+}
+
 }  // namespace grmg

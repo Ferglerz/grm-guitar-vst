@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace grmg {
@@ -80,7 +81,50 @@ public:
     std::vector<RollNote> notes;
     std::vector<RollStrum> strums;
 
+    // the loop: between two flags of the ruler (beats); loop_end < 0: the end of the song
+    double loop_start = 0.0, loop_end = -1.0;
+    static constexpr int MAX_BARS = 256;
+
     double length_beats() const { return (double) bars * beats_per_bar; }
+    double max_beats() const { return (double) MAX_BARS * beats_per_bar; }
+
+    // where the loop is, inside the song (the whole song if the flags are not set or out of it)
+    std::pair<double, double> loop_range() const {
+        const double len = length_beats();
+        const double a = std::min(std::max(loop_start, 0.0), len);
+        const double b = loop_end < 0 ? len : std::min(std::max(loop_end, 0.0), len);
+        if (b <= a + 1e-9) return {0.0, len};
+        return {a, b};
+    }
+
+    // the notes and strums that start in [a, b), moved so that a is their 0
+    Song section(double a, double b) const {
+        Song out = *this;
+        out.notes.clear();
+        out.strums.clear();
+        for (auto n : notes)
+            if (n.start >= a - 1e-9 && n.start < b - 1e-9) {
+                n.start -= a;
+                out.notes.push_back(n);
+            }
+        for (auto t : strums)
+            if (t.start >= a - 1e-9 && t.start < b - 1e-9) {
+                t.start -= a;
+                out.strums.push_back(t);
+            }
+        out.bars = std::max(1, (int) std::ceil((b - a) / beats_per_bar - 1e-9));
+        out.loop_start = 0.0;
+        out.loop_end = -1.0;
+        return out;
+    }
+
+    // the song grows to hold everything written in it
+    void fit_content() {
+        double end = 0.0;
+        for (const auto& n : notes) end = std::max(end, n.start + 1e-6);
+        for (const auto& t : strums) end = std::max(end, t.start + 1e-6);
+        bars = std::min(MAX_BARS, std::max(bars, (int) std::ceil(end / beats_per_bar)));
+    }
 
     // the strings of a chord an arpeggio slot picks (arpeggio_slot of grm_guitar.py)
     static std::vector<int> arpeggio_slot(const int* frets, const std::string& slot) {
@@ -172,6 +216,7 @@ public:
         o.precision(10);
         o << "grm-guitar-roll 1\n";
         o << "bars " << bars << " " << beats_per_bar << " " << tempo << "\n";
+        if (loop_start > 0 || loop_end >= 0) o << "loop " << loop_start << " " << loop_end << "\n";
         for (const auto& n : notes)
             o << "note " << n.string << " " << n.fret << " " << n.start << " " << n.length << " " << n.velocity << " "
               << (n.palm ? 1 : 0) << "\n";
@@ -193,6 +238,8 @@ public:
         while (in >> word) {
             if (word == "bars") {
                 in >> s.bars >> s.beats_per_bar >> s.tempo;
+            } else if (word == "loop") {
+                in >> s.loop_start >> s.loop_end;
             } else if (word == "note") {
                 RollNote n;
                 int palm = 0;
@@ -215,7 +262,7 @@ public:
             }
         }
         if (in.bad()) return false;
-        s.bars = std::max(1, std::min(s.bars, 256));
+        s.bars = std::max(1, std::min(s.bars, MAX_BARS));
         s.beats_per_bar = std::max(1, std::min(s.beats_per_bar, 12));
         *this = s;
         sort();

@@ -39,6 +39,23 @@ int main() {
         expect("admittance", "re" + std::to_string((int) f), Y.real());
         expect("admittance", "im" + std::to_string((int) f), Y.imag());
     }
+    // the loaded top: braces and bridge on the plate (about 200 g by default), the measured Q on every mode
+    {
+        const auto loaded = body_network_result(1.0, 2.8, 0.35, BRACES_KG, BODY_Q);
+        ++checks;
+        if (std::abs(loaded["Mloaded"] - 0.2) > 0.01 || std::abs(loaded["Q"] - BODY_Q) > 1e-6
+            || std::abs(loaded["Mm"] / body["Mm"] - loaded["Mloaded"] / body["Mtop"]) > 1e-6) {
+            ++failures;
+            std::printf("FAIL loaded top: %.4f kg, Q %.2f\n", loaded["Mloaded"], loaded["Q"]);
+        }
+        // a heavier top moves less under the string: lower admittance off its resonances
+        const Body heavy = body_network(1.0, 2.8, 0.35, BRACES_KG, BODY_Q);
+        ++checks;
+        if (!(heavy.admittance(1000.0).real() < b.admittance(1000.0).real())) {
+            ++failures;
+            std::printf("FAIL loaded top admittance\n");
+        }
+    }
     // room
     const std::pair<int, int> rooms[2] = {{1, 1}, {3, 0}};
     const char* room_tests[2] = {"room_Living", "room_Church"};
@@ -143,7 +160,9 @@ int main() {
             p.pluck = 0.22;
             p.palm = with_palm ? &palm : nullptr;
             StringVoice voice;
-            voice.start(p, b, 3.0, 0.6, 44100.0);
+            StringLosses legacy;
+            legacy.legacy = 3.0;          // the loss curve of the Python app, for this parity check
+            voice.start(p, b, legacy, 0.6, 44100.0);
             std::vector<double> y(44100, 0.0);
             voice.render(y.data(), 44100);
             const char* t = with_palm ? "voice_palm" : "voice";
@@ -156,6 +175,44 @@ int main() {
                 expect(t, "rms" + std::to_string(k), std::sqrt(e / (double) (w[k][1] - w[k][0])), tol);
             }
             expect(t, "sample100", y[100], with_palm ? 5e-2 : 1e-8);
+        }
+    }
+    // the losses network: new strings give Woodhouse's measured losses, and the decay follows his law
+    {
+        for (int i = 0; i < NUM_STRINGS; ++i) {
+            const auto r = string_losses_network(i, 0.0);
+            ++checks;
+            if (std::abs(std::log10(r["etaB"] / LOSSES_NEW[i].etaB)) > 1e-6
+                || std::abs(std::log10(r["etaA"] / LOSSES_NEW[i].etaA)) > 1e-6) {
+                ++failures;
+                std::printf("FAIL losses of string %d (new)\n", i);
+            }
+            const auto q = string_losses_network(i, 1.0);
+            ++checks;
+            if (std::abs(std::log10(q["etaF"] / LOSSES_PLAYED[i].etaF)) > 1e-6) {
+                ++failures;
+                std::printf("FAIL losses of string %d (played)\n", i);
+            }
+        }
+        // low E, new: the fundamental rings longest, the partial near 3 kHz much less (Woodhouse: ~8 s, ~1.5 s)
+        const auto r = string_losses_network(0, 0.0);
+        const StringLosses L {r["etaF"], r["etaA"], r["etaB"], 0.0};
+        const double B = 1.06e-4, f1 = 82.41;
+        const double t60_1 = 6.9078 / L.sigma(f1, 1, B);
+        const int n = 36;
+        const double t60_36 = 6.9078 / L.sigma(n * f1 * std::sqrt(1 + B * n * n), n, B);
+        ++checks;
+        if (std::abs(t60_1 - 8.0) > 0.3 || std::abs(t60_36 - 1.5) > 0.3 || !(t60_1 > 3 * t60_36)) {
+            ++failures;
+            std::printf("FAIL decay law: T60 %.2f s (n = 1), %.2f s (n = 36)\n", t60_1, t60_36);
+        }
+        // a played string loses its highs sooner than a new one
+        const auto old = string_losses_network(0, 1.0);
+        const StringLosses O {old["etaF"], old["etaA"], old["etaB"], 0.0};
+        ++checks;
+        if (!(O.sigma(3000, 36, B) > 2 * L.sigma(3000, 36, B))) {
+            ++failures;
+            std::printf("FAIL played strings\n");
         }
     }
     std::printf("%d checks, %d failures\n", checks, failures);

@@ -38,8 +38,12 @@ if(GRMG_BUILD_PLUGIN)
         GIT_SHALLOW ON)
     FetchContent_MakeAvailable(JUCE)
 
+    # The vendor is the one of Anthony's other plugins (the hosts list them together). The codes stay those of the
+    # first versions: a host knows a plugin by them, and changing them would lose every session made with it.
+    set(PROJECT_VENDOR "InnerMost47")
     juce_add_plugin(GRMGuitar
-        COMPANY_NAME "Anthony Charretier"
+        COMPANY_NAME ${PROJECT_VENDOR}
+        BUNDLE_ID "com.innermost47.grm-guitar"
         PLUGIN_MANUFACTURER_CODE Grmc
         PLUGIN_CODE Grmg
         FORMATS VST3 Standalone
@@ -52,6 +56,7 @@ if(GRMG_BUILD_PLUGIN)
 
     target_sources(GRMGuitar PRIVATE
         plugin/PluginProcessor.cpp
+        plugin/GuitarTrack.cpp
         plugin/PluginEditor.cpp
         plugin/RollView.cpp)
 
@@ -77,5 +82,8 @@ if(GRMG_BUILD_PLUGIN)
         add_executable(plugin_host_test tests/plugin_host_test.cpp)
         target_link_libraries(plugin_host_test PRIVATE GRMGuitar juce::juce_audio_formats juce::juce_recommended_config_flags)
         target_compile_definitions(plugin_host_test PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+        add_executable(editor_snapshot tests/editor_snapshot.cpp)
+        target_link_libraries(editor_snapshot PRIVATE GRMGuitar juce::juce_audio_formats juce::juce_recommended_config_flags)
+        target_compile_definitions(editor_snapshot PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
     endif()
 endif()

@@ -32,4 +32,22 @@ inline std::array<std::vector<double>, 2> body_and_room(const std::vector<double
     return out;
 }
 
+// what the chosen sensor gives, offline: the microphone hears the body in the room; a piezo under the saddle
+// the force on the bridge; a magnetic pickup the strings' velocity under it, through its circuit.
+// The levels of the three are matched by fixed scales (calibration, not physics): see SENSOR_SCALE.
+constexpr double SENSOR_SCALE[3] = {1.0, PICKUP_LEVEL, PIEZO_LEVEL};
+
+inline std::array<std::vector<double>, 2> sensor_output(const std::vector<double>& force, const std::vector<double>& pickup,
+                                                        const Model& m) {
+    if (m.s.sensor == 0) return body_and_room(force, m);
+    std::vector<double> y(force.size());
+    if (m.s.sensor == 2) {
+        for (size_t t = 0; t < y.size(); ++t) y[t] = SENSOR_SCALE[2] * force[t];
+    } else {
+        Biquad f = pickup_filter(m.pickup, m.sample_rate);
+        for (size_t t = 0; t < y.size() && t < pickup.size(); ++t) y[t] = SENSOR_SCALE[1] * f.process(pickup[t]);
+    }
+    return {y, y};
+}
+
 }  // namespace grmg

@@ -3,7 +3,6 @@
 #include "PluginProcessor.h"
 
 #include "PluginEditor.h"
-#include "../core/offline.hpp"
 
 namespace {
 
@@ -22,121 +21,63 @@ juce::StringArray materialNames() {
     for (const auto& m : grmg::MATERIALS) a.add(m.name);
     return a;
 }
+juce::StringArray woodNames() {
+    juce::StringArray a;
+    for (const auto& w : grmg::WOODS) a.add(w.name);
+    return a;
+}
+juce::StringArray pickupNames() {
+    juce::StringArray a;
+    for (const auto& t : grmg::PICKUP_TYPES) a.add(t.name);
+    return a;
+}
+
+// a guitar's parameters, in the order of the layout (copied from slot to slot when a guitar is removed)
+const char* const GUITAR_PARAMS[] = {
+    "tuning", "string_age", "brightness", "core", "stiff", "attack", "pluck", "force", "pick", "palm_mm",
+    "palm_intensity", "live_palm", "body_size", "top_mm", "coupling", "braces_g", "body_q", "body_amount", "wood",
+    "density_pct", "hollow", "sensor", "pickup_mm", "pickup_type", "cable_pf", "sympathy", "room_on", "room_size",
+    "room_material", "room_distance", "human", "swing_cm", "finger_noises", "finger_force", "mix_gain", "mix_level",
+    "mix_pan", "mix_mute", "mix_solo", "mix_out"};
+
+float dbToGain(float db) { return std::pow(10.0f, db / 20.0f); }
 
 }  // namespace
 
 // ================================================================== the solver thread
 void SolverThread::run() {
-    grmg::Settings solvedFor;
-    std::shared_ptr<const grmg::Model> model;
-    grmg::Compiler compiler;
-    int compiledSong = -1;
-    unsigned compiledSeed = 0;
-    double compiledTempo = 0.0;
-    bool compiledLoop = false;
-    const grmg::Model* compiledModel = nullptr;
-    double modelRate = 0.0;
-    auto sameSettings = [](const grmg::Settings& a, const grmg::Settings& b) {
-        using M = grmg::Model;
-        return M::same_strings(a, b) && M::same_attack(a, b) && M::same_palm(a, b) && M::same_body(a, b)
-               && M::same_room(a, b);
-    };
-    auto samePlayer = [](const grmg::Settings& a, const grmg::Settings& b) {
-        return a.human == b.human && std::abs(a.swing_cm - b.swing_cm) < 1e-9 && a.finger_noises == b.finger_noises
-               && std::abs(a.finger_force - b.finger_force) < 1e-9;
-    };
-    grmg::Settings compiledPlayer;
-
     while (!threadShouldExit()) {
-        owner.modelBox.collect();
-        owner.perfBox.collect();
         const double sr = owner.sampleRate.load();
         if (sr <= 0) {
             wait(50);
             continue;
         }
-        const auto s = owner.readSettings();
-        // 1) the networks of the sound: strings first (instant), then the palm and the room (slower)
-        if (!model || !sameSettings(s, solvedFor) || std::abs(sr - modelRate) > 1e-6) {
-            owner.solving.store(true);
-            try {
-                auto quick = std::make_shared<grmg::Model>();
-                quick->solve(s, sr, model ? model.get() : nullptr, false);
-                owner.modelBox.post(owner.makeHolder(quick));
-                owner.solvedStage.store(1);
-                if (threadShouldExit()) break;
-                auto full = std::make_shared<grmg::Model>();
-                full->solve(s, sr, quick.get(), true);
-                model = full;
-                solvedFor = s;
-                modelRate = sr;
-                owner.modelBox.post(owner.makeHolder(full));
-                owner.show(full);
-                owner.solvedStage.store(2);
-            } catch (const std::exception& e) {
-                DBG("GRM solver: " << e.what());
-                solvedFor = s;           // do not loop on a setting the networks cannot solve
-                modelRate = sr;
-            }
-            owner.solving.store(false);
-        } else if (std::abs(model->s.resonance - s.resonance) > 1e-12 || std::abs(model->s.brightness - s.brightness) > 1e-12
-                   || model->s.sympathy != s.sympathy || std::abs(model->s.body_amount - s.body_amount) > 1e-12
-                   || model->s.room_on != s.room_on) {
-            // settings read when a note starts: a copy of the model carries them
-            auto copy = std::make_shared<grmg::Model>(*model);
-            copy->s.resonance = s.resonance;
-            copy->s.brightness = s.brightness;
-            copy->s.sympathy = s.sympathy;
-            copy->s.body_amount = s.body_amount;
-            copy->s.room_on = s.room_on;
-            model = copy;
-            owner.modelBox.post(owner.makeHolder(copy));
-            owner.show(copy);
-        }
-        // 2) the guitar roll, played by the player network
-        const int version = owner.songVersion.load();
         const unsigned sd = owner.seed.load();
         const double tempo = owner.currentTempo.load();
         const bool loop = owner.params.getRawParameterValue("loop")->load() > 0.5f;
-        if (model && (version != compiledSong || sd != compiledSeed || std::abs(tempo - compiledTempo) > 0.01 || loop != compiledLoop
-                      || model.get() != compiledModel || !samePlayer(s, compiledPlayer))) {
-            grmg::Song song;
-            {
-                std::lock_guard<std::mutex> lock(owner.songLock);
-                song = owner.song;
-            }
-            try {
-                grmg::Settings ps = model->s;          // the player settings of now, with the model's networks
-                ps.human = s.human;
-                ps.swing_cm = s.swing_cm;
-                ps.finger_noises = s.finger_noises;
-                ps.finger_force = s.finger_force;
-                auto m = std::make_shared<grmg::Model>(*model);
-                m->s = ps;
-                grmg::CompileOptions o;
-                o.tempo = tempo;
-                o.seed = sd;
-                o.loop = loop;
-                auto perf = compiler.compile(song, m, o);
-                owner.perfBox.post(perf.release());
-            } catch (const std::exception& e) {
-                DBG("GRM compiler: " << e.what());
-            }
-            compiledSong = version;
-            compiledSeed = sd;
-            compiledTempo = tempo;
-            compiledLoop = loop;
-            compiledModel = model.get();
-            compiledPlayer = s;
+        // the selected guitar first: it is the one being listened to while its settings move
+        const int count = owner.guitarCount.load(), first = owner.selected.load();
+        for (int k = 0; k < count && !threadShouldExit(); ++k) {
+            const int g = (first + k) % count;
+            owner.tracks[(size_t) g]->solveStep(sr, sd, tempo, loop, owner.solving, owner.solvedStage,
+                                                [this] { return threadShouldExit(); });
         }
+        for (int g = count; g < GRMGuitarProcessor::MAX_GUITARS; ++g) owner.tracks[(size_t) g]->collect();
         wait(30);
     }
 }
 
 // ================================================================== the processor
-GRMGuitarProcessor::GRMGuitarProcessor()
-    : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-      params(*this, nullptr, "GRMGuitar", createLayout()) {
+// the main output, and one output per guitar slot (off until the host enables it)
+juce::AudioProcessor::BusesProperties GRMGuitarProcessor::buses() {
+    auto b = BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true);
+    for (int g = 0; g < MAX_GUITARS; ++g) b = b.withOutput("Guitar " + juce::String(g + 1), juce::AudioChannelSet::stereo(), false);
+    return b;
+}
+
+GRMGuitarProcessor::GRMGuitarProcessor() : AudioProcessor(buses()), params(*this, nullptr, "GRMGuitar", createLayout()) {
+    for (int g = 0; g < MAX_GUITARS; ++g) tracks[(size_t) g] = std::make_unique<GuitarTrack>(params, g);
+    limiterGain.fill(1.0f);
     solver.startThread();
 }
 
@@ -145,53 +86,270 @@ GRMGuitarProcessor::~GRMGuitarProcessor() {
     if (exportThread.joinable()) exportThread.join();
 }
 
+juce::AudioProcessorValueTreeState::ParameterLayout GRMGuitarProcessor::createLayout() {
+    using namespace juce;
+    std::vector<std::unique_ptr<RangedAudioParameter>> p;
+    String prefix, idPrefix;    // the guitar the next parameters belong to ("G2 ", "g2_"; empty for guitar 1)
+    // centre: the value at the middle of the slider (0: linear)
+    auto real = [&](const char* id, const char* name, float lo, float hi, float def, float centre = 0.0f, float step = 0.0f) {
+        NormalisableRange<float> r(lo, hi, step);
+        if (centre > lo && centre < hi) r.setSkewForCentre(centre);
+        const int decimals = hi - lo > 50 ? 0 : hi - lo > 5 ? 1 : 2;
+        p.push_back(std::make_unique<AudioParameterFloat>(
+            ParameterID {idPrefix + id, 1}, prefix + name, r, def,
+            AudioParameterFloatAttributes().withStringFromValueFunction([decimals](float v, int) { return String(v, decimals); })));
+    };
+    auto flag = [&](const char* id, const char* name, bool def) {
+        p.push_back(std::make_unique<AudioParameterBool>(ParameterID {idPrefix + id, 1}, prefix + name, def));
+    };
+    auto choice = [&](const char* id, const char* name, const StringArray& c, int def) {
+        p.push_back(std::make_unique<AudioParameterChoice>(ParameterID {idPrefix + id, 1}, prefix + name, c, def));
+    };
+    for (int g = 0; g < MAX_GUITARS; ++g) {
+        prefix = g == 0 ? String() : "G" + String(g + 1) + " ";
+        idPrefix = g == 0 ? String() : "g" + String(g + 1) + "_";
+        // strings
+        choice("tuning", "Tuning", tuningNames(), 0);
+        real("string_age", "String age (0 new, 1 played)", 0.0f, 1.0f, 0.0f);
+        real("brightness", "Brightness", 0.0f, 1.0f, 0.6f);
+        real("core", "Wound core", 0.2f, 1.0f, 0.45f);
+        flag("stiff", "Stiff strings", true);
+        // attack
+        choice("attack", "Attack", StringArray {"Pick", "Fingers"}, 0);
+        real("pluck", "Pluck point", 0.05f, 0.5f, 0.22f);
+        real("force", "Pluck force (N)", 0.3f, 6.0f, 2.0f, 1.5f);
+        real("pick", "Pick (mm)", 0.4f, 1.5f, 0.71f);
+        // palm
+        real("palm_mm", "Palm from bridge (mm)", 5.0f, 80.0f, 30.0f);
+        real("palm_intensity", "Palm pressure (0: lifted)", 0.0f, 4.0f, 1.0f, 1.0f);
+        flag("live_palm", "Palm mute (live)", false);
+        // body
+        real("body_size", "Body size", 0.8f, 1.25f, 1.0f);
+        real("top_mm", "Top (mm)", 2.0f, 4.0f, 2.8f);
+        real("coupling", "Air / top coupling", 0.1f, 0.6f, 0.35f);
+        real("braces_g", "Braces (g)", 10.0f, 200.0f, 64.0f, 64.0f, 1.0f);
+        real("body_q", "Body resonance (Q)", 10.0f, 150.0f, 50.0f, 50.0f, 1.0f);
+        real("body_amount", "Body", 0.0f, 1.0f, 0.85f);
+        choice("wood", "Wood", woodNames(), 0);
+        real("density_pct", "Wood density (% of the species)", -30.0f, 30.0f, 0.0f, 0.0f, 1.0f);
+        real("hollow", "Body: solid (0) to hollow (1)", 0.0f, 1.0f, 1.0f);
+        // sensor
+        choice("sensor", "Sensor", StringArray {"Microphone (body and room)", "Magnetic pickup", "Piezo under the saddle"}, 0);
+        real("pickup_mm", "Pickup from the saddle (mm)", 20.0f, 200.0f, 100.0f, 0.0f, 1.0f);
+        choice("pickup_type", "Pickup", pickupNames(), 0);
+        real("cable_pf", "Cable (pF)", 100.0f, 1500.0f, 500.0f, 500.0f, 10.0f);
+        flag("sympathy", "Sympathetic strings", true);
+        // room
+        flag("room_on", "Room", true);
+        choice("room_size", "Room size", roomNames(), 1);
+        choice("room_material", "Walls", materialNames(), 2);
+        real("room_distance", "Listener (m)", 0.3f, 6.0f, 1.0f, 1.5f);
+        // player
+        flag("human", "Human feel", true);
+        real("swing_cm", "Arm swing (cm)", 4.0f, 20.0f, 10.0f);
+        flag("finger_noises", "Finger noises", true);
+        real("finger_force", "Finger force (N)", 0.1f, 2.0f, 0.6f, 0.6f);
+        // mixer strip
+        real("mix_gain", "Gain (dB)", -24.0f, 24.0f, 0.0f, 0.0f, 0.1f);
+        real("mix_level", "Level", 0.0f, 2.0f, 1.0f, 1.0f);
+        real("mix_pan", "Pan", -1.0f, 1.0f, 0.0f);
+        flag("mix_mute", "Mute", false);
+        flag("mix_solo", "Solo", false);
+        choice("mix_out", "Output", StringArray {"Main", "Own output"}, 0);
+    }
+    prefix = idPrefix = String();
+    // the plugin
+    real("volume", "Volume", 0.0f, 2.0f, 1.0f, 1.0f);
+    choice("midi_strings", "MIDI to strings", StringArray {"Lowest fret", "Channel = string"}, 0);
+    choice("midi_route", "MIDI to guitars", StringArray {"Selected guitar", "Channel = guitar"}, 0);
+    flag("loop", "Loop the roll", true);
+    flag("follow_host", "Follow the host", true);
+    choice("midi_mode", "MIDI keys", StringArray {"Play notes", "Play patterns"}, 0);
+    flag("follow_playhead", "Roll follows the playhead", true);
+    flag("ghosts", "Show the other guitars", true);
+    real("tempo", "Tempo (standalone)", 40.0f, 220.0f, 90.0f, 1.0f, 1.0f);
+    return {p.begin(), p.end()};
+}
+
+// ================================================================== guitars
+void GRMGuitarProcessor::selectGuitar(int g) {
+    g = juce::jlimit(0, guitarCount.load() - 1, g);
+    if (g == selected.load()) return;
+    selected.store(g);
+    guitarVersion.fetch_add(1);
+    solver.notify();
+}
+
+void GRMGuitarProcessor::addGuitar() {
+    const int count = guitarCount.load();
+    if (count >= MAX_GUITARS) return;
+    // a fresh slot: its parameters at their defaults, one empty pattern
+    for (auto* id : GUITAR_PARAMS)
+        if (auto* p = params.getParameter(GuitarTrack::paramId(count, id))) p->setValueNotifyingHost(p->getDefaultValue());
+    grmg::Song empty;
+    empty.bars = 4;
+    tracks[(size_t) count]->setPatterns({empty}, 0);
+    guitarCount.store(count + 1);
+    selected.store(count);
+    guitarVersion.fetch_add(1);
+    solver.notify();
+}
+
+void GRMGuitarProcessor::removeGuitar(int g) {
+    const int count = guitarCount.load();
+    if (count <= 1 || g < 0 || g >= count) return;
+    // the guitars after it move down one slot: their settings and patterns with them
+    for (int k = g; k + 1 < count; ++k) {
+        for (auto* id : GUITAR_PARAMS) {
+            auto* to = params.getParameter(GuitarTrack::paramId(k, id));
+            auto* from = params.getParameter(GuitarTrack::paramId(k + 1, id));
+            if (to && from) to->setValueNotifyingHost(from->getValue());
+        }
+        tracks[(size_t) k]->setPatterns(tracks[(size_t) k + 1]->getPatterns(), tracks[(size_t) k + 1]->getEditingPattern());
+    }
+    guitarCount.store(count - 1);
+    selected.store(juce::jmin(selected.load(), count - 2));
+    guitarVersion.fetch_add(1);
+    solver.notify();
+}
+
+juce::String GRMGuitarProcessor::getGuitarName(int g) const { return "Guitar " + juce::String(g + 1); }
+
+// ================================================================== the roll of the selected guitar
+void GRMGuitarProcessor::setSong(const grmg::Song& s) {
+    current().setSong(s);
+    solver.notify();
+}
+
+void GRMGuitarProcessor::addPattern(bool duplicate) {
+    current().addPattern(duplicate);
+    solver.notify();
+}
+
+void GRMGuitarProcessor::deletePattern() {
+    current().deletePattern();
+    solver.notify();
+}
+
+void GRMGuitarProcessor::copyPattern() {
+    const auto text = juce::String(current().getSong().to_text());
+    {
+        std::lock_guard<std::mutex> lock(clipLock);
+        copiedPattern = text;
+    }
+    juce::SystemClipboard::copyTextToClipboard(text);   // another instance can paste it too
+}
+
+bool GRMGuitarProcessor::pastePattern() {
+    juce::String text = juce::SystemClipboard::getTextFromClipboard();
+    if (!text.startsWith("grm-guitar-roll")) {
+        std::lock_guard<std::mutex> lock(clipLock);
+        text = copiedPattern;
+    }
+    grmg::Song s;
+    if (text.isEmpty() || !s.from_text(text.toStdString())) return false;
+    for (auto& n : s.notes) n.selected = false;
+    for (auto& t : s.strums) t.selected = false;
+    current().insertPattern(s);
+    solver.notify();
+    return true;
+}
+
+bool GRMGuitarProcessor::hasCopiedPattern() const {
+    std::lock_guard<std::mutex> lock(clipLock);
+    return copiedPattern.isNotEmpty();
+}
+
+void GRMGuitarProcessor::newTake() {
+    seed.store((unsigned) juce::Random::getSystemRandom().nextInt(1 << 30) + 1u);
+    solver.notify();
+}
+
+void GRMGuitarProcessor::setInternalPlaying(bool on) {
+    if (on && !internalPlaying.load()) internalSeek.store(0.0);
+    internalPlaying.store(on);
+}
+
+int GRMGuitarProcessor::getOpenMidi(int i) const {
+    const int t = juce::jlimit(0, grmg::NUM_TUNINGS - 1, (int) std::lround(current().param("tuning")));
+    return grmg::TUNINGS[t].midi[i];
+}
+
+juce::String GRMGuitarProcessor::getStatus() const {
+    if (exporting.load()) return "Rendering the song to a WAV file...";
+    {
+        std::lock_guard<std::mutex> lock(exportLock);
+        if (exportResult.isNotEmpty()) return exportResult;
+    }
+    if (sampleRate.load() <= 0) return "Waiting for the audio device";
+    if (solving.load()) return solvedStage.load() >= 1 ? "Solving the palm and the room networks..." : "Solving the networks...";
+    return "Networks solved";
+}
+
+// ================================================================== export: every guitar, mixed
 void GRMGuitarProcessor::exportSong(const juce::File& file) {
     if (exporting.exchange(true)) return;
     if (exportThread.joinable()) exportThread.join();
-    const auto settings = readSettings();
-    const auto s = getSong();
+    struct Part { grmg::Settings settings; grmg::Song song; float gain, pan; int index; };
+    std::vector<Part> parts;
+    bool solo = false;
+    for (int g = 0; g < guitarCount.load(); ++g) solo |= tracks[(size_t) g]->param("mix_solo") > 0.5f;
+    for (int g = 0; g < guitarCount.load(); ++g) {
+        const auto& t = *tracks[(size_t) g];
+        if (t.param("mix_mute") > 0.5f || (solo && t.param("mix_solo") < 0.5f)) continue;
+        parts.push_back({t.readSettings(), t.getSong(), dbToGain(t.param("mix_gain")) * t.param("mix_level"), t.param("mix_pan"), g});
+    }
     const double tempo = currentTempo.load();
     const unsigned sd = seed.load();
-    exportThread = std::thread([this, settings, s, tempo, sd, file] {
+    exportThread = std::thread([this, parts, tempo, sd, file] {
         juce::String result;
         try {
             const double sr = 48000.0;
-            auto model = std::make_shared<grmg::Model>();
-            model->solve(settings, sr, nullptr, true);
-            grmg::Compiler compiler;
-            grmg::CompileOptions o;
-            o.tempo = tempo;
-            o.seed = sd;
-            auto perf = compiler.compile(s, model, o);
-            grmg::Engine e;
-            e.prepare(sr);
-            e.set_model(model.get());
-            e.set_performance(perf.get());
-            grmg::Transport tr;
-            tr.playing = true;
-            tr.loop = false;
-            tr.beats_per_sample = tempo / 60.0 / sr;
-            const size_t total = (size_t) ((s.length_beats() * 60.0 / tempo + 4.0) * sr);
-            std::vector<float> out(total, 0.0f);
-            for (size_t pos = 0; pos < total; pos += 512) {
-                tr.beat = (double) pos * tr.beats_per_sample;
-                e.render(out.data() + pos, (int) std::min<size_t>(512, total - pos), tr);
+            std::array<std::vector<double>, 2> mix;
+            for (const auto& part : parts) {
+                auto model = std::make_shared<grmg::Model>();
+                model->solve(part.settings, sr, nullptr, true);
+                grmg::Compiler compiler;
+                grmg::CompileOptions o;
+                o.tempo = tempo;
+                o.seed = sd + 7919u * (unsigned) part.index;
+                auto perf = compiler.compile(part.song, model, o);
+                grmg::Engine e;
+                e.prepare(sr);
+                e.set_model(model.get());
+                e.set_performance(perf.get());
+                grmg::Transport tr;
+                tr.playing = true;
+                tr.loop = false;
+                tr.beats_per_sample = tempo / 60.0 / sr;
+                const size_t total = (size_t) ((part.song.length_beats() * 60.0 / tempo + 4.0) * sr);
+                std::vector<float> out(total, 0.0f), heard(total, 0.0f);
+                for (size_t pos = 0; pos < total; pos += 512) {
+                    tr.beat = (double) pos * tr.beats_per_sample;
+                    e.render(out.data() + pos, (int) std::min<size_t>(512, total - pos), tr, heard.data() + pos);
+                }
+                const auto stereo = grmg::sensor_output(std::vector<double>(out.begin(), out.end()),
+                                                        std::vector<double>(heard.begin(), heard.end()), *model);
+                const double l = std::min(1.0, 1.0 - part.pan) * part.gain, r = std::min(1.0, 1.0 + part.pan) * part.gain;
+                for (int ch = 0; ch < 2; ++ch) {
+                    auto& m = mix[(size_t) ch];
+                    if (m.size() < stereo[(size_t) ch].size()) m.resize(stereo[(size_t) ch].size(), 0.0);
+                    for (size_t t = 0; t < stereo[(size_t) ch].size(); ++t) m[t] += (ch ? r : l) * stereo[(size_t) ch][t];
+                }
             }
-            const auto stereo = grmg::body_and_room(std::vector<double>(out.begin(), out.end()), *model);
             double peak = 1e-12;
-            for (const auto& c : stereo)
+            for (const auto& c : mix)
                 for (double v : c) peak = std::max(peak, std::abs(v));
-            juce::AudioBuffer<float> buf(2, (int) stereo[0].size());
+            juce::AudioBuffer<float> buf(2, (int) mix[0].size());
             for (int ch = 0; ch < 2; ++ch)
-                for (int t = 0; t < buf.getNumSamples(); ++t)
-                    buf.setSample(ch, t, (float) (stereo[(size_t) ch][(size_t) t] / peak * 0.89));
+                for (int t = 0; t < buf.getNumSamples(); ++t) buf.setSample(ch, t, (float) (mix[(size_t) ch][(size_t) t] / peak * 0.89));
             juce::WavAudioFormat wav;
             file.deleteFile();
             std::unique_ptr<juce::OutputStream> stream(file.createOutputStream());
             std::unique_ptr<juce::AudioFormatWriter> writer;
             if (stream)
                 writer = wav.createWriterFor(stream, juce::AudioFormatWriterOptions {}.withSampleRate(sr).withNumChannels(2).withBitsPerSample(24));
-            if (writer) {
+            if (writer && buf.getNumSamples() > 0) {
                 writer->writeFromAudioSampleBuffer(buf, 0, buf.getNumSamples());
                 result = "Exported " + file.getFileName();
             } else {
@@ -208,269 +366,151 @@ void GRMGuitarProcessor::exportSong(const juce::File& file) {
     });
 }
 
-juce::AudioProcessorValueTreeState::ParameterLayout GRMGuitarProcessor::createLayout() {
-    using namespace juce;
-    std::vector<std::unique_ptr<RangedAudioParameter>> p;
-    // centre: the value at the middle of the slider (0: linear)
-    auto real = [&](const char* id, const char* name, float lo, float hi, float def, float centre = 0.0f, float step = 0.0f) {
-        NormalisableRange<float> r(lo, hi, step);
-        if (centre > lo && centre < hi) r.setSkewForCentre(centre);
-        const int decimals = hi - lo > 50 ? 0 : hi - lo > 5 ? 1 : 2;
-        p.push_back(std::make_unique<AudioParameterFloat>(
-            ParameterID {id, 1}, name, r, def,
-            AudioParameterFloatAttributes().withStringFromValueFunction([decimals](float v, int) { return String(v, decimals); })));
-    };
-    auto flag = [&](const char* id, const char* name, bool def) {
-        p.push_back(std::make_unique<AudioParameterBool>(ParameterID {id, 1}, name, def));
-    };
-    auto choice = [&](const char* id, const char* name, const StringArray& c, int def) {
-        p.push_back(std::make_unique<AudioParameterChoice>(ParameterID {id, 1}, name, c, def));
-    };
-    // strings
-    choice("tuning", "Tuning", tuningNames(), 0);
-    real("resonance", "Resonance (s)", 0.2f, 8.0f, 3.0f, 2.0f);
-    real("brightness", "Brightness", 0.0f, 1.0f, 0.6f);
-    real("core", "Wound core", 0.2f, 1.0f, 0.45f);
-    flag("stiff", "Stiff strings", true);
-    // attack
-    choice("attack", "Attack", StringArray {"Pick", "Fingers"}, 0);
-    real("pluck", "Pluck point", 0.05f, 0.5f, 0.22f);
-    real("force", "Pluck force (N)", 0.3f, 6.0f, 2.0f, 1.5f);
-    real("pick", "Pick (mm)", 0.4f, 1.5f, 0.71f);
-    // palm
-    real("palm_mm", "Palm from bridge (mm)", 5.0f, 80.0f, 30.0f);
-    real("palm_intensity", "Palm pressure (0: lifted)", 0.0f, 4.0f, 1.0f, 1.0f);
-    flag("live_palm", "Palm mute (live)", false);
-    // body
-    real("body_size", "Body size", 0.8f, 1.25f, 1.0f);
-    real("top_mm", "Top (mm)", 2.0f, 4.0f, 2.8f);
-    real("coupling", "Air / top coupling", 0.1f, 0.6f, 0.35f);
-    real("body_amount", "Body", 0.0f, 1.0f, 0.85f);
-    flag("sympathy", "Sympathetic strings", true);
-    // room
-    flag("room_on", "Room", true);
-    choice("room_size", "Room size", roomNames(), 1);
-    choice("room_material", "Walls", materialNames(), 2);
-    real("room_distance", "Listener (m)", 0.3f, 6.0f, 1.0f, 1.5f);
-    // player
-    flag("human", "Human feel", true);
-    real("swing_cm", "Arm swing (cm)", 4.0f, 20.0f, 10.0f);
-    flag("finger_noises", "Finger noises", true);
-    real("finger_force", "Finger force (N)", 0.1f, 2.0f, 0.6f, 0.6f);
-    // output and MIDI
-    real("volume", "Volume", 0.0f, 2.0f, 1.0f, 1.0f);
-    choice("midi_strings", "MIDI to strings", StringArray {"Lowest fret", "Channel = string"}, 0);
-    flag("loop", "Loop the roll", true);
-    flag("follow_host", "Follow the host", true);
-    real("tempo", "Tempo (standalone)", 40.0f, 220.0f, 90.0f, 1.0f, 1.0f);
-    return {p.begin(), p.end()};
-}
-
-grmg::Settings GRMGuitarProcessor::readSettings() const {
-    auto v = [&](const char* id) { return (double) params.getRawParameterValue(id)->load(); };
-    auto b = [&](const char* id) { return params.getRawParameterValue(id)->load() > 0.5f; };
-    auto c = [&](const char* id) { return (int) std::lround(params.getRawParameterValue(id)->load()); };
-    grmg::Settings s;
-    s.tuning = juce::jlimit(0, grmg::NUM_TUNINGS - 1, c("tuning"));
-    s.resonance = v("resonance");
-    s.brightness = v("brightness");
-    s.core = v("core");
-    s.stiff = b("stiff");
-    s.pick = c("attack") == 0;
-    s.pluck = v("pluck");
-    s.force = v("force");
-    s.pick_mm = v("pick");
-    s.palm_mm = std::round(v("palm_mm"));
-    // steps of 0.05 in log (each one a palm network to solve); below grmg::PALM_OFF the palm is lifted
-    s.palm_intensity = v("palm_intensity") < grmg::PALM_OFF
-                           ? 0.0
-                           : std::pow(10.0, std::round(std::log10(v("palm_intensity")) / 0.05) * 0.05);
-    s.body_size = v("body_size");
-    s.top_mm = v("top_mm");
-    s.coupling = v("coupling");
-    s.body_amount = v("body_amount");
-    s.sympathy = b("sympathy");
-    s.room_on = b("room_on");
-    s.room_size = juce::jlimit(0, 3, c("room_size"));
-    s.room_material = juce::jlimit(0, 5, c("room_material"));
-    s.room_distance = std::round(v("room_distance") * 10.0) / 10.0;
-    s.human = b("human");
-    s.swing_cm = v("swing_cm");
-    s.finger_noises = b("finger_noises");
-    s.finger_force = v("finger_force");
-    return s;
-}
-
-GRMGuitarProcessor::ModelHolder* GRMGuitarProcessor::makeHolder(std::shared_ptr<const grmg::Model> m) {
-    auto* h = new ModelHolder;
-    h->model = m;
-    if (!m->body_ir.empty()) {
-        h->body.setSize(1, (int) m->body_ir.size());
-        std::copy(m->body_ir.begin(), m->body_ir.end(), h->body.getWritePointer(0));
-    }
-    if (!m->room_ir[0].empty()) {
-        h->room.setSize(2, (int) m->room_ir[0].size());
-        for (int ch = 0; ch < 2; ++ch)
-            std::copy(m->room_ir[(size_t) ch].begin(), m->room_ir[(size_t) ch].end(), h->room.getWritePointer(ch));
-    }
-    return h;
-}
-
+// ================================================================== audio
 void GRMGuitarProcessor::prepareToPlay(double sr, int samplesPerBlock) {
-    engine.prepare(sr);
-    juce::dsp::ProcessSpec mono {sr, (juce::uint32) samplesPerBlock, 1};
-    juce::dsp::ProcessSpec stereo {sr, (juce::uint32) samplesPerBlock, 2};
-    bodyConv.prepare(mono);
-    roomConv.prepare(stereo);
-    dry.setSize(1, samplesPerBlock);
-    wet.setSize(2, samplesPerBlock);
-    bodyMix.reset(sr, 0.05);
+    for (auto& t : tracks) t->prepare(sr, samplesPerBlock);
     volume.reset(sr, 0.05);
+    for (int g = 0; g < MAX_GUITARS; ++g) {
+        stripGain[(size_t) g].reset(sr, 0.05);
+        stripPan[(size_t) g].reset(sr, 0.05);
+    }
     sampleRate.store(sr);
     solver.notify();
 }
 
 bool GRMGuitarProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
-    const auto out = layouts.getMainOutputChannelSet();
-    return out == juce::AudioChannelSet::mono() || out == juce::AudioChannelSet::stereo();
+    const auto main = layouts.getMainOutputChannelSet();
+    if (main != juce::AudioChannelSet::mono() && main != juce::AudioChannelSet::stereo()) return false;
+    for (int b = 1; b < layouts.outputBuses.size(); ++b) {
+        const auto& set = layouts.outputBuses.getReference(b);
+        if (!set.isDisabled() && set != juce::AudioChannelSet::stereo()) return false;
+    }
+    return true;
 }
 
 void GRMGuitarProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) {
     juce::ScopedNoDenormals noDenormals;
     const int n = buffer.getNumSamples();
     const double sr = getSampleRate();
-    if (dry.getNumSamples() < n) {           // a host sending more than it announced
-        dry.setSize(1, n, false, false, true);
-        wet.setSize(2, n, false, false, true);
-    }
-    // the newest networks and performance, taken between two blocks
-    if (auto* h = modelBox.take()) {
-        engine.set_model(h->model.get());
-        // impulse responses built by the solver: loading them is wait-free (juce::dsp::Convolution)
-        if (h->model->body_id != loadedBody && h->body.getNumSamples() > 0) {
-            bodyConv.loadImpulseResponse(std::move(h->body), h->model->sample_rate, juce::dsp::Convolution::Stereo::no,
-                                         juce::dsp::Convolution::Trim::no, juce::dsp::Convolution::Normalise::no);
-            loadedBody = h->model->body_id;
-        }
-        if (h->model->room_id != loadedRoom && h->room.getNumSamples() > 0) {
-            roomConv.loadImpulseResponse(std::move(h->room), h->model->sample_rate, juce::dsp::Convolution::Stereo::yes,
-                                         juce::dsp::Convolution::Trim::no, juce::dsp::Convolution::Normalise::no);
-            loadedRoom = h->model->room_id;
-            roomLoaded.store(true);
-        }
-    }
-    engine.set_performance(perfBox.take());
-    const auto* model = engine.model();
-    engine.live_palm = params.getRawParameterValue("live_palm")->load() > 0.5f;
-    engine.midi_strings = params.getRawParameterValue("midi_strings")->load() > 0.5f
-                              ? grmg::Engine::MidiStrings::channel_per_string
-                              : grmg::Engine::MidiStrings::automatic;
+    const int count = guitarCount.load();
+    const bool patternMode = params.getRawParameterValue("midi_mode")->load() > 0.5f;
+    const bool playingOwn = internalPlaying.load();
 
-    // ---------------------------------------------------------------- where the roll is
-    grmg::Transport tr;
-    tr.loop = params.getRawParameterValue("loop")->load() > 0.5f;
+    // ---------------------------------------------------------------- where the song is (one clock for every guitar)
+    SongClock clock;
+    clock.loop = params.getRawParameterValue("loop")->load() > 0.5f;
     double tempo = params.getRawParameterValue("tempo")->load();
-    bool host = false;
     if (params.getRawParameterValue("follow_host")->load() > 0.5f)
         if (auto* ph = getPlayHead())
             if (auto pos = ph->getPosition()) {
                 if (auto bpm = pos->getBpm()) tempo = *bpm;
                 if (pos->getIsPlaying())
                     if (auto ppq = pos->getPpqPosition()) {
-                        host = true;
-                        tr.playing = true;
-                        tr.beat = *ppq;
+                        clock.host = true;
+                        clock.playing = true;
+                        clock.beat = *ppq;
                     }
             }
-    hostPlaying.store(host);
+    if (patternMode && !playingOwn) clock.host = clock.playing = false;   // the keys play the patterns, not the timeline
+    hostPlaying.store(clock.host);
     tempo = juce::jlimit(20.0, 400.0, tempo);
     if (std::abs(tempo - currentTempo.load()) > 0.01) currentTempo.store(tempo);
-    tr.beats_per_sample = tempo / 60.0 / sr;
-    if (!host) {
+    clock.beats_per_sample = tempo / 60.0 / sr;
+    if (!clock.host) {
         const double seek = internalSeek.exchange(-1.0);
-        if (seek >= 0) internalBeat = seek;
-        tr.playing = internalPlaying.load();
-        tr.beat = internalBeat;
-        if (tr.playing) {
-            internalBeat += n * tr.beats_per_sample;
-            const auto* perf = engine.performance();
-            const double len = perf ? perf->length_beats : 16.0;
-            if (tr.loop) internalBeat = std::fmod(internalBeat, len);
-            else if (internalBeat > len + 4.0 * tempo / 60.0) internalPlaying.store(false);   // the end rings 4 s
+        if (seek >= 0) {
+            internalStart = seek;
+            internalElapsed = 0.0;
+        }
+        clock.playing = playingOwn;
+        clock.start = internalStart;
+        clock.beat = internalElapsed;
+    }
+
+    // ---------------------------------------------------------------- every guitar: newest networks, MIDI, strings
+    for (int g = 0; g < count; ++g) {
+        tracks[(size_t) g]->ensure(n);
+        tracks[(size_t) g]->begin(patternMode, playingOwn);
+    }
+    const bool byChannel = params.getRawParameterValue("midi_route")->load() > 0.5f;
+    const int sel = juce::jlimit(0, count - 1, selected.load());
+    for (const auto meta : midi) {
+        const auto msg = meta.getMessage();
+        const int target = byChannel && msg.getChannel() >= 1 && msg.getChannel() <= count ? msg.getChannel() - 1 : sel;
+        auto& t = *tracks[(size_t) target];
+        t.renderTo(juce::jlimit(0, n, meta.samplePosition), clock);
+        t.midi(msg);
+    }
+    for (int g = 0; g < count; ++g) {
+        tracks[(size_t) g]->renderTo(n, clock);
+        tracks[(size_t) g]->finish(n, sr);
+    }
+    if (!clock.host && clock.playing) {
+        internalElapsed += n * clock.beats_per_sample;
+        if (!clock.loop) {                        // the end of the longest guitar, and 4 s of ringing
+            double longest = 0.0;
+            for (int g = 0; g < count; ++g)
+                if (const auto* p = tracks[(size_t) g]->engine.performance()) longest = std::max(longest, p->length_beats);
+            if (internalStart + internalElapsed > longest + 4.0 * tempo / 60.0) internalPlaying.store(false);
         }
     }
 
-    // ---------------------------------------------------------------- strings struck on the neck
-    {
-        const auto scope = uiFifo.read(uiFifo.getNumReady());
-        auto play = [&](int start, int size) {
-            for (int k = 0; k < size; ++k) {
-                const auto& u = uiPlucks[(size_t) (start + k)];
-                engine.pluck_string(u.string, u.fret, u.velocity);
-            }
-        };
-        play(scope.startIndex1, scope.blockSize1);
-        play(scope.startIndex2, scope.blockSize2);
-    }
-
-    // ---------------------------------------------------------------- the strings, MIDI at its sample
-    float* d = dry.getWritePointer(0);
-    int pos = 0;
-    auto renderTo = [&](int at) {
-        if (at <= pos) return;
-        grmg::Transport part = tr;
-        part.beat = tr.beat + pos * tr.beats_per_sample;
-        engine.render(d + pos, at - pos, part);
-        pos = at;
+    // ---------------------------------------------------------------- the mixer: each guitar to its output
+    for (int ch = 0; ch < buffer.getNumChannels(); ++ch) buffer.clear(ch, 0, n);
+    bool solo = false;
+    for (int g = 0; g < count; ++g) solo |= tracks[(size_t) g]->param("mix_solo") > 0.5f;
+    // an output the host enabled and gave channels for (a host may pass fewer channels than the layout says)
+    auto usable = [&](int b) {
+        auto* bus = getBus(false, b);
+        return bus && bus->isEnabled() && bus->getNumberOfChannels() > 0
+               && getChannelIndexInProcessBlockBuffer(false, b, bus->getNumberOfChannels() - 1) < buffer.getNumChannels();
     };
-    for (const auto meta : midi) {
-        const auto msg = meta.getMessage();
-        renderTo(juce::jlimit(0, n, meta.samplePosition));
-        if (msg.isNoteOn()) engine.note_on(msg.getNoteNumber(), msg.getFloatVelocity(), msg.getChannel());
-        else if (msg.isNoteOff()) engine.note_off(msg.getNoteNumber());
-        else if (msg.isAllNotesOff() || msg.isAllSoundOff()) engine.all_off();
+    auto mainBus = getBusBuffer(buffer, false, 0);
+    for (int g = 0; g < count; ++g) {
+        auto& t = *tracks[(size_t) g];
+        const bool silent = t.param("mix_mute") > 0.5f || (solo && t.param("mix_solo") < 0.5f);
+        stripGain[(size_t) g].setTargetValue(silent ? 0.0f : dbToGain(t.param("mix_gain")) * t.param("mix_level"));
+        stripPan[(size_t) g].setTargetValue(t.param("mix_pan"));
+        const bool own = t.param("mix_out") > 0.5f && usable(g + 1);
+        auto bus = own ? getBusBuffer(buffer, false, g + 1) : mainBus;
+        const float* l = t.out.getReadPointer(0);
+        const float* r = t.out.getReadPointer(1);
+        for (int k = 0; k < n; ++k) {
+            const float gain = stripGain[(size_t) g].getNextValue(), pan = stripPan[(size_t) g].getNextValue();
+            // a balance: the centre keeps both sides at full level (the one-guitar versions' level)
+            const float gl = gain * std::min(1.0f, 1.0f - pan), gr = gain * std::min(1.0f, 1.0f + pan);
+            if (bus.getNumChannels() == 1) {
+                bus.addSample(0, k, 0.5f * (gl * l[k] + gr * r[k]));
+            } else if (bus.getNumChannels() >= 2) {
+                bus.addSample(0, k, gl * l[k]);
+                bus.addSample(1, k, gr * r[k]);
+            }
+        }
     }
-    renderTo(n);
-
-    // ---------------------------------------------------------------- body, then room
-    bodyMix.setTargetValue(model ? (float) model->s.body_amount : 0.85f);
+    // the main output's volume, then a peak limiter on every output that only acts above LIMIT and lowers the gain
+    // smoothly instead of bending the wave
     volume.setTargetValue(params.getRawParameterValue("volume")->load());
-    wet.clear();
-    wet.copyFrom(0, 0, dry, 0, 0, n);
-    {
-        juce::dsp::AudioBlock<float> block(wet.getArrayOfWritePointers(), 1, (size_t) n);
-        bodyConv.process(juce::dsp::ProcessContextReplacing<float>(block));
+    for (int k = 0; k < n; ++k) {
+        const float v = volume.getNextValue();
+        for (int ch = 0; ch < mainBus.getNumChannels(); ++ch) mainBus.setSample(ch, k, mainBus.getSample(ch, k) * v);
     }
-    float* w0 = wet.getWritePointer(0);
-    for (int t = 0; t < n; ++t) {
-        const float a = bodyMix.getNextValue();
-        w0[t] = (1.0f - a) * d[t] + a * w0[t];
-    }
-    wet.copyFrom(1, 0, wet, 0, 0, n);
-    const bool room = model && model->s.room_on && roomLoaded.load();
-    if (room) {
-        juce::dsp::AudioBlock<float> block(wet.getArrayOfWritePointers(), 2, (size_t) n);
-        roomConv.process(juce::dsp::ProcessContextReplacing<float>(block));
-    }
-    // newtons to the output: a fixed scale (the default song peaks around -9 dBFS at volume 1: headroom for
-    // harder playing), then a peak limiter that only acts above LIMIT and reduces the gain smoothly instead of
-    // bending the wave (no distortion when a strong stroke goes over)
-    const int outs = buffer.getNumChannels();
-    constexpr float SCALE = 0.018f, LIMIT = 0.89f;
+    constexpr float LIMIT = 0.89f;
     const float release = std::exp(-1.0f / (0.15f * (float) sr));
-    for (int t = 0; t < n; ++t) {
-        const float g = volume.getNextValue() * SCALE;
-        float l = wet.getSample(0, t) * g, r = wet.getSample(1, t) * g;
-        const float peak = std::max(std::abs(l), std::abs(r));
-        const float need = peak > LIMIT ? LIMIT / peak : 1.0f;
-        limiterGain = need < limiterGain ? need : 1.0f - (1.0f - limiterGain) * release;
-        l *= limiterGain;
-        r *= limiterGain;
-        for (int ch = 0; ch < outs; ++ch) buffer.setSample(ch, t, outs == 1 ? 0.5f * (l + r) : (ch % 2 == 0 ? l : r));
+    for (int b = 0; b < getBusCount(false) && b <= MAX_GUITARS; ++b) {
+        if (b > 0 && !usable(b)) continue;
+        auto bus = getBusBuffer(buffer, false, b);
+        float& lg = limiterGain[(size_t) b];
+        for (int k = 0; k < n; ++k) {
+            float peak = 0.0f;
+            for (int ch = 0; ch < bus.getNumChannels(); ++ch) peak = std::max(peak, std::abs(bus.getSample(ch, k)));
+            const float need = peak > LIMIT ? LIMIT / peak : 1.0f;
+            lg = need < lg ? need : 1.0f - (1.0f - lg) * release;
+            for (int ch = 0; ch < bus.getNumChannels(); ++ch) bus.setSample(ch, k, bus.getSample(ch, k) * lg);
+        }
     }
-    // the oscilloscope
+    // the oscilloscope (main output)
     const auto scope = scopeFifo.write(std::min(n, scopeFifo.getFreeSpace()));
-    const float* o = buffer.getReadPointer(0);
+    const float* o = mainBus.getReadPointer(0);
     for (int k = 0; k < scope.blockSize1; ++k) scopeData[(size_t) (scope.startIndex1 + k)] = o[k];
     for (int k = 0; k < scope.blockSize2; ++k) scopeData[(size_t) (scope.startIndex2 + k)] = o[scope.blockSize1 + k];
 }
@@ -482,74 +522,64 @@ int GRMGuitarProcessor::readScope(float* dest, int count) {
     return scope.blockSize1 + scope.blockSize2;
 }
 
-void GRMGuitarProcessor::pluckFromInterface(int string, int fret, float velocity) {
-    const auto scope = uiFifo.write(1);
-    if (scope.blockSize1 > 0) uiPlucks[(size_t) scope.startIndex1] = {string, fret, velocity};
-    else if (scope.blockSize2 > 0) uiPlucks[(size_t) scope.startIndex2] = {string, fret, velocity};
-}
-
-int GRMGuitarProcessor::getOpenMidi(int i) const {
-    const int t = juce::jlimit(0, grmg::NUM_TUNINGS - 1, (int) std::lround(params.getRawParameterValue("tuning")->load()));
-    return grmg::TUNINGS[t].midi[i];
-}
-
-juce::String GRMGuitarProcessor::getStatus() const {
-    if (exporting.load()) return "Rendering the roll to a WAV file...";
-    {
-        std::lock_guard<std::mutex> lock(exportLock);
-        if (exportResult.isNotEmpty()) return exportResult;
-    }
-    if (sampleRate.load() <= 0) return "Waiting for the audio device";
-    if (solving.load()) return solvedStage.load() >= 1 ? "Solving the palm and the room networks..." : "Solving the networks...";
-    return "Networks solved";
-}
-
-grmg::Song GRMGuitarProcessor::getSong() const {
-    std::lock_guard<std::mutex> lock(songLock);
-    return song;
-}
-
-void GRMGuitarProcessor::setSong(const grmg::Song& s) {
-    {
-        std::lock_guard<std::mutex> lock(songLock);
-        song = s;
-    }
-    songVersion.fetch_add(1);
-    solver.notify();
-}
-
-void GRMGuitarProcessor::newTake() {
-    seed.store((unsigned) juce::Random::getSystemRandom().nextInt(1 << 30) + 1u);
-    solver.notify();
-}
-
-void GRMGuitarProcessor::setInternalPlaying(bool on) {
-    if (on && !internalPlaying.load()) internalSeek.store(0.0);
-    internalPlaying.store(on);
-}
-
 juce::AudioProcessorEditor* GRMGuitarProcessor::createEditor() { return new GRMGuitarEditor(*this); }
 
+// ================================================================== state
+// Guitar 1 keeps the keys of the one-guitar versions ("song", "pattern_count", "pattern_0"...), so that an older
+// session opens as it was and an older version still reads guitar 1 of a newer session.
 void GRMGuitarProcessor::getStateInformation(juce::MemoryBlock& destData) {
     auto state = params.copyState();
-    state.setProperty("song", juce::String(getSong().to_text()), nullptr);
+    const int count = guitarCount.load();
+    state.setProperty("guitars", count, nullptr);
+    state.setProperty("selected", selected.load(), nullptr);
+    for (int g = 0; g < count; ++g) {
+        const auto patterns = tracks[(size_t) g]->getPatterns();
+        auto key = [g](const juce::String& k) { return GuitarTrack::paramId(g, k); };
+        if (g == 0) state.setProperty("song", juce::String(patterns[0].to_text()), nullptr);
+        state.setProperty(key("pattern_count"), (int) patterns.size(), nullptr);
+        for (size_t k = 0; k < patterns.size(); ++k)
+            state.setProperty(key("pattern_" + juce::String((int) k)), juce::String(patterns[k].to_text()), nullptr);
+        state.setProperty(key("editing"), tracks[(size_t) g]->getEditingPattern(), nullptr);
+    }
     state.setProperty("seed", (int) seed.load(), nullptr);
     if (auto xml = state.createXml()) copyXmlToBinary(*xml, destData);
 }
 
 void GRMGuitarProcessor::setStateInformation(const void* data, int sizeInBytes) {
-    if (auto xml = getXmlFromBinary(data, sizeInBytes))
-        if (xml->hasTagName(params.state.getType())) {
-            auto tree = juce::ValueTree::fromXml(*xml);
-            if (tree.hasProperty("song")) {
-                grmg::Song s;
-                if (s.from_text(tree.getProperty("song").toString().toStdString())) setSong(s);
-                stateVersion.fetch_add(1);
-            }
-            if (tree.hasProperty("seed")) seed.store((unsigned) (juce::int64) tree.getProperty("seed"));
-            params.replaceState(tree);
-            solver.notify();
+    auto xml = getXmlFromBinary(data, sizeInBytes);
+    if (!xml || !xml->hasTagName(params.state.getType())) return;
+    auto tree = juce::ValueTree::fromXml(*xml);
+    const int count = juce::jlimit(1, MAX_GUITARS, (int) tree.getProperty("guitars", 1));
+    for (int g = 0; g < count; ++g) {
+        auto key = [g](const juce::String& k) { return GuitarTrack::paramId(g, k); };
+        std::vector<grmg::Song> loaded;
+        const int n = tree.getProperty(key("pattern_count"), 0);
+        for (int k = 0; k < juce::jmin(n, MAX_PATTERNS); ++k) {
+            grmg::Song s;
+            if (s.from_text(tree.getProperty(key("pattern_" + juce::String(k))).toString().toStdString())) loaded.push_back(s);
         }
+        if (loaded.empty() && g == 0 && tree.hasProperty("song")) {    // a session of the first versions: one pattern
+            grmg::Song s;
+            if (s.from_text(tree.getProperty("song").toString().toStdString())) loaded.push_back(s);
+        }
+        if (loaded.empty()) {
+            grmg::Song empty;
+            empty.bars = 4;
+            loaded.push_back(empty);
+        }
+        tracks[(size_t) g]->setPatterns(loaded, (int) tree.getProperty(key("editing"), 0));
+        tree.removeProperty(key("pattern_count"), nullptr);
+        tree.removeProperty(key("editing"), nullptr);
+        for (int k = 0; k < n; ++k) tree.removeProperty(key("pattern_" + juce::String(k)), nullptr);
+    }
+    guitarCount.store(count);
+    selected.store(juce::jlimit(0, count - 1, (int) tree.getProperty("selected", 0)));
+    if (tree.hasProperty("seed")) seed.store((unsigned) (juce::int64) tree.getProperty("seed"));
+    for (auto id : {"song", "guitars", "selected", "seed"}) tree.removeProperty(id, nullptr);
+    params.replaceState(tree);
+    guitarVersion.fetch_add(1);
+    stateVersion.fetch_add(1);
+    solver.notify();
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new GRMGuitarProcessor(); }

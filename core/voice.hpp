@@ -3,7 +3,7 @@
 //
 // One string as it sounds: the force it puts on the bridge (newtons), as synthesize_string in grm_guitar.py.
 //   - a bank of modes, each a damped complex oscillator, released from the triangle of the pluck;
-//   - losses: inside the string and the air, the energy given to the bridge (body network), the palm;
+//   - losses: inside the string and the air (losses network), the energy given to the bridge (body network), the palm;
 //   - under the palm, the modes move (palm network) and some no longer ring at all (overdamped: two real
 //     exponentials); the palm's pressure drops while the pick goes through and comes back (PALM_RECOVER);
 //   - the onset is the release itself, softened by the release time of the attack network.
@@ -46,7 +46,9 @@ public:
     Pluck what;
     int note = -1;          // MIDI note that holds it (live playing), -1 otherwise
 
-    void start(const Pluck& p, const Body& body, double resonance, double brightness, double sr) {
+    // pickup_x > 0: a magnetic pickup listens at that distance from the saddle (render's `pickup` output)
+    void start(const Pluck& p, const Body& body, const StringLosses& losses, double brightness, double sr,
+               double pickup_x = 0.0) {
         what = p;
         sr_ = sr;
         count_ = 0;
@@ -75,7 +77,7 @@ public:
             const double a = amp[(size_t) k];
             if (std::abs(a) < 1e-4 * peak) continue;               // inaudible (a node at the pluck point)
             double f = n * pl.f1 * std::sqrt(1.0 + pl.B * n * n);
-            double sg = (1.0 + (f / 1800.0) * (f / 1800.0)) / resonance + body.loss(f, pl.c, pl.Leff, pl.Zs);
+            double sg = losses.sigma(f, n, pl.B) + body.loss(f, pl.c, pl.Leff, pl.Zs);
             double sp = 0.0;
             if (p.palm) {
                 sp = p.palm->sigma_at((size_t) k);
@@ -91,6 +93,9 @@ public:
                 z_[m] = scale * a * cplx(1.0, -sg / wd);
                 step_[m] = std::exp(cplx(-sg, wd) / sr_);
                 rate_[m] = cplx(-sg, wd);
+                // the pickup hears the string's velocity where it sits: mode n's bridge force T (n pi / L) y_n
+                // turned into its displacement there, y_n sin(n pi x / L), and derived in time
+                pick_[m] = pickup_x > 0 ? rate_[m] * (pl.Leff / (pl.T * n * PI)) * std::sin(n * PI * pickup_x / pl.Leff) : 0.0;
                 q_[m] = regain ? sp * PALM_DROP * PALM_RECOVER : 0.0;
                 if (regain) z_[m] *= std::exp(q_[m]);              // once the palm is back
             } else {
@@ -133,11 +138,11 @@ public:
         note = -1;
     }
 
-    void render(double* out, int samples) {
+    void render(double* out, int samples, double* pickup = nullptr) {
         if (!active) return;
         double peak = 0.0;
         for (int t = 0; t < samples; ++t) {
-            double sum = 0.0;
+            double sum = 0.0, heard = 0.0;
             if (regain_ && t_ < regain_end_) {
                 // the palm presses less during the stroke: exp(-q e^(-t / R)) on top of the full damping
                 // (the factor changes slowly: computed every 16 samples)
@@ -148,6 +153,7 @@ public:
                 for (int k = 0; k < count_; ++k) {
                     const size_t m = (size_t) k;
                     sum += z_[m].real() * g_[m];
+                    if (pickup) heard += (z_[m] * pick_[m]).real() * g_[m];
                     z_[m] *= step_[m];
                 }
                 if (t_ + 1 == regain_end_) {                       // from now on the palm is back
@@ -158,6 +164,7 @@ public:
             } else {
                 for (int k = 0; k < count_; ++k) {
                     sum += z_[(size_t) k].real();
+                    if (pickup) heard += (z_[(size_t) k] * pick_[(size_t) k]).real();
                     z_[(size_t) k] *= step_[(size_t) k];
                 }
             }
@@ -176,8 +183,10 @@ public:
                     return;
                 }
                 sum *= fade_;
+                heard *= fade_;
             }
             out[t] += sum;
+            if (pickup) pickup[t] += heard;
             peak = std::max(peak, std::abs(sum));
             ++t_;
         }
@@ -190,7 +199,7 @@ private:
     long t_ = 0, regain_end_ = 0;
     bool regain_ = false;
     double onset_ = 0, onset_step_ = 0, fade_ = 1, fade_step_ = 0;
-    std::array<cplx, MAX_MODES> z_{}, step_{}, rate_{};
+    std::array<cplx, MAX_MODES> z_{}, step_{}, rate_{}, pick_{};
     std::array<double, MAX_MODES> q_{}, g_{};
     std::array<std::array<double, 2>, MAX_MODES> oc_{}, od_{};
 };
@@ -203,19 +212,23 @@ public:
     int fret = 0;
     bool palm = false;
 
-    void set(const Place& pl, const Palm* palm_net, const Body& body, double resonance, double sr) {
+    void set(const Place& pl, const Palm* palm_net, const Body& body, const StringLosses& losses, double sr,
+             double pickup_x = 0.0) {
         sr_ = sr;
         count_ = 0;
         gain_ = 2 * pl.T / pl.Leff;
         for (int n = 1; n <= SYMPATHY_MODES; ++n) {
             const double f = n * pl.f1 * std::sqrt(1.0 + pl.B * n * n);
             if (f >= 0.45 * sr) break;
-            double sg = (1.0 + (f / 1800.0) * (f / 1800.0)) / resonance + body.loss(f, pl.c, pl.Leff, pl.Zs)
+            double sg = losses.sigma(f, n, pl.B) + body.loss(f, pl.c, pl.Leff, pl.Zs)
                         + body.coupling(f, pl.c, pl.Leff, pl.Zs);
             if (palm_net) sg += palm_net->sigma_at((size_t) n - 1);
             const size_t k = (size_t) count_++;
             step_[k] = std::exp(cplx(-sg, 2 * PI * f) / sr);
             drive_[k] = -body.admittance(f) / sr;
+            // its force gain_ Re z on the bridge, as a velocity where the pickup sits (see StringVoice)
+            pick_[k] = pickup_x > 0 ? cplx(-sg, 2 * PI * f) * gain_ * (pl.Leff / (pl.T * n * PI)) * std::sin(n * PI * pickup_x / pl.Leff)
+                                    : 0.0;
             z_[k] = 0.0;
         }
         for (int k = count_; k < SYMPATHY_MODES; ++k) z_[(size_t) k] = 0.0;
@@ -232,19 +245,21 @@ public:
     }
 
     // in: the force of the other strings on the bridge; adds its own force to out
-    void render(const double* in, double* out, int samples) {
+    void render(const double* in, double* out, int samples, double* pickup = nullptr) {
         if (!on) return;
         for (int t = 0; t < samples; ++t) {
-            double sum = 0.0;
+            double sum = 0.0, heard = 0.0;
             const double x = in[t];
             for (int k = 0; k < count_; ++k) {
                 const size_t m = (size_t) k;
                 z_[m] = z_[m] * step_[m] + drive_[m] * x;
                 sum += z_[m].real();
+                if (pickup) heard += (z_[m] * pick_[m]).real();
             }
             if (level_ < target_) level_ = std::min(target_, level_ + fade_step_);
             else if (level_ > target_) level_ = std::max(target_, level_ - fade_step_);
             out[t] += gain_ * sum * level_;
+            if (pickup) pickup[t] += heard * level_;
         }
         if (target_ <= 0.0 && level_ <= 0.0) on = false;
     }
@@ -252,7 +267,7 @@ public:
 private:
     double sr_ = 48000.0, gain_ = 0.0, level_ = 0.0, target_ = 0.0, fade_step_ = 0.0;
     int count_ = 0;
-    std::array<cplx, SYMPATHY_MODES> z_{}, step_{}, drive_{};
+    std::array<cplx, SYMPATHY_MODES> z_{}, step_{}, drive_{}, pick_{};
 };
 
 }  // namespace grmg

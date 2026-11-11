@@ -156,7 +156,9 @@ public:
     }
 
     // ------------------------------------------------------------ the block
-    void render(float* out, int samples, const Transport& tr) {
+    // pickup: when the model's sensor is a magnetic pickup, what it hears (string velocity at the pickup, before
+    // its circuit); may be null
+    void render(float* out, int samples, const Transport& tr, float* pickup = nullptr) {
         if (live_palm != live_palm_was_) {
             // the palm comes down on the strings: what rings is damped at once (the palm takes the high modes
             // first), and the free strings are under it; lifted, the free strings ring open again
@@ -169,7 +171,7 @@ public:
         int pos = 0;
         while (pos < samples) {
             const int n = std::min(samples - pos, BLOCK);
-            render_part(out + pos, n, tr, pos);
+            render_part(out + pos, n, tr, pos, pickup ? pickup + pos : nullptr);
             pos += n;
         }
         if (was_playing_ && !tr.playing) {             // the transport stops: the hands stop the strings
@@ -191,6 +193,7 @@ private:
     std::array<SqueakPlay, NUM_STRINGS * 2> squeaks_{};
     std::array<std::vector<double>, NUM_STRINGS> string_force_;
     std::vector<double> total_, others_, mix_;
+    std::array<double, 256> pickup_{};
     bool sym_set_ = false, relocate_ = true, was_playing_ = false, palm_down_ = false;
     bool song_palm_ = false, live_palm_was_ = false;
     static constexpr double LIVE_PALM_DAMP = 60.0;   // s^-1: a palm laid on ringing strings
@@ -211,7 +214,7 @@ private:
         auto& s = sym_[(size_t) i];
         s.fret = fret;
         s.palm = palm != nullptr;
-        s.set(m.place[(size_t) i][(size_t) fret], palm, m.body, m.s.resonance, sr_);
+        s.set(m.place[(size_t) i][(size_t) fret], palm, m.body, m.losses[(size_t) i], sr_, m.pickup_x());
         s.free_from_now(fade);
     }
 
@@ -226,7 +229,7 @@ private:
             fading_[(size_t) p.string] = v;
             fading_[(size_t) p.string].fade_out(0.02);
         }
-        v.start(p, m.body, m.s.resonance, m.s.brightness, sr_);
+        v.start(p, m.body, m.losses[(size_t) p.string], m.s.brightness, sr_, m.pickup_x());
         v.note = -1;
         shown_fret[(size_t) p.string].store(p.fret);
         if (!m.s.sympathy) return;
@@ -256,7 +259,7 @@ private:
     }
 
     // `n` samples (n <= BLOCK): song events at their sample, strings, bridge
-    void render_part(float* out, int n, const Transport& tr, int offset) {
+    void render_part(float* out, int n, const Transport& tr, int offset, float* pk) {
         int pos = 0;
         const bool song = tr.playing && perf_ && model_ && tr.beats_per_sample > 0;
         double beat = tr.beat + offset * tr.beats_per_sample;
@@ -283,14 +286,14 @@ private:
                     if (at >= until - pos) break;
                     const int k = pos + std::max(0, (int) std::floor(at));
                     if (k > pos) {
-                        synth(out + pos, k - pos);
+                        synth(out + pos, k - pos, pk ? pk + pos : nullptr);
                         beat += (k - pos) * tr.beats_per_sample;
                         pos = k;
                     }
                     apply(perf_->events[next_++]);
                 }
                 if (until > pos) {
-                    synth(out + pos, until - pos);
+                    synth(out + pos, until - pos, pk ? pk + pos : nullptr);
                     beat += (until - pos) * tr.beats_per_sample;
                     pos = until;
                 }
@@ -301,21 +304,24 @@ private:
                 }
             }
             expected_beat_ = beat;
-            shown_beat.store(beat);
+            shown_beat.store(beat + perf_->origin);
         } else {
-            synth(out, n);
+            synth(out, n, pk);
             shown_beat.store(tr.playing ? beat : -1.0);
         }
     }
 
-    void synth(float* out, int n) {
+    void synth(float* out, int n, float* pk = nullptr) {
         if (n <= 0) return;
+        double* heard = pk ? pickup_.data() : nullptr;
+        if (heard)
+            for (int t = 0; t < n; ++t) heard[t] = 0.0;
         for (int t = 0; t < n; ++t) total_[(size_t) t] = 0.0;
         for (int i = 0; i < NUM_STRINGS; ++i) {
             auto& f = string_force_[(size_t) i];
             for (int t = 0; t < n; ++t) f[(size_t) t] = 0.0;
-            voices_[(size_t) i].render(f.data(), n);
-            fading_[(size_t) i].render(f.data(), n);
+            voices_[(size_t) i].render(f.data(), n, heard);
+            fading_[(size_t) i].render(f.data(), n, heard);
         }
         for (auto& s : squeaks_) {
             if (!s.sound) continue;
@@ -339,10 +345,12 @@ private:
                 if (!sym_[(size_t) i].on) continue;
                 const auto& f = string_force_[(size_t) i];
                 for (int t = 0; t < n; ++t) others_[(size_t) t] = total_[(size_t) t] - f[(size_t) t];
-                sym_[(size_t) i].render(others_.data(), mix_.data(), n);
+                sym_[(size_t) i].render(others_.data(), mix_.data(), n, heard);
             }
         }
         for (int t = 0; t < n; ++t) out[t] = (float) mix_[(size_t) t];
+        if (pk)
+            for (int t = 0; t < n; ++t) pk[t] = (float) heard[t];
         for (int i = 0; i < NUM_STRINGS; ++i)
             shown_level[(size_t) i].store(std::max(level[i], shown_level[(size_t) i].load() * 0.97f));
     }

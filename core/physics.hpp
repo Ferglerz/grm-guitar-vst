@@ -59,7 +59,51 @@ struct Body {
     }
 };
 
-inline grm::Result body_network_result(double size = 1.0, double top_mm = 2.8, double k = 0.35) {
+// braces_kg < 0: the network of the Python app (the bare plate is the moving top, the Q of each mode fixed);
+// braces_kg >= 0: the top carries its braces and the bridge (a top with them weighs about 200 g, Woodhouse et al.,
+// Acta Acustica 2021), and every mode has the measured Q `q` (about 50 for a guitar, same source)
+constexpr double BRACES_KG = 0.064, BODY_Q = 50.0;   // defaults: 64 g of braces make the default top about 200 g
+
+// the woods of a top or a body: density at 12 % moisture (specific gravity x 1120 kg/m^3) and modulus of
+// elasticity along the grain, from the Wood Handbook (USDA Forest Products Laboratory), tables 5-3b and 5-5b
+struct Wood { const char* name; double rho, E; };
+constexpr Wood WOODS[] = {
+    {"Sitka spruce", 0.40 * 1120, 1.57 * 6.894757e9}, {"Engelmann spruce", 0.35 * 1120, 1.30 * 6.894757e9},
+    {"Western red cedar", 0.32 * 1120, 1.11 * 6.894757e9}, {"Mahogany", 0.45 * 1120, 1.50 * 6.894757e9},
+    {"Sugar maple", 0.63 * 1120, 1.83 * 6.894757e9}, {"Red alder", 0.41 * 1120, 1.38 * 6.894757e9},
+    {"Basswood", 0.37 * 1120, 1.46 * 6.894757e9}, {"Black walnut", 0.55 * 1120, 1.68 * 6.894757e9}};
+constexpr int NUM_WOODS = (int) (sizeof(WOODS) / sizeof(WOODS[0]));
+constexpr double SLAB_M = 0.0445;     // thickness of a solid body (a Stratocaster's: 1 3/4 inch)
+
+// What the body is made of and how hollow it is. hollow = 1: a flat-top acoustic (the cavity, a thin top);
+// hollow = 0: a solid body (no cavity, the top is the whole slab). In between, a path chosen between the two
+// (not measured): the cavity's volume and the air / top coupling shrink with `hollow`, the top thickens
+// geometrically from the top to the slab.
+struct BodySpec {
+    double size = 1.0, top_mm = 2.8, coupling = 0.35, braces_kg = -1.0, q = BODY_Q;
+    double rho = 430.0, E = 1.0e10;    // the Python app's top (Sitka spruce in the WOODS table)
+    double hollow = 1.0;
+};
+
+inline grm::Result body_network_result(const BodySpec& b);
+
+inline grm::Result body_network_result(double size = 1.0, double top_mm = 2.8, double k = 0.35, double braces_kg = -1.0,
+                                       double q = BODY_Q) {
+    BodySpec b;
+    b.size = size;
+    b.top_mm = top_mm;
+    b.coupling = k;
+    b.braces_kg = braces_kg;
+    b.q = q;
+    return body_network_result(b);
+}
+
+inline grm::Result body_network_result(const BodySpec& spec) {
+    const double size = spec.size, braces_kg = spec.braces_kg, q = spec.q;
+    const double hollow = std::min(std::max(spec.hollow, 0.0), 1.0);
+    const double air = std::max(hollow, 1e-3);          // what is left of the cavity
+    const double k = spec.coupling * hollow;
+    const double top_m = std::pow(spec.top_mm / 1000.0, hollow) * std::pow(SLAB_M, 1.0 - hollow);
     grm::Network net;
     const std::pair<const char*, double> g[] = {
         {"Tair", T_AIR}, {"cair", 340.0}, {"V", 0.02}, {"r", 0.05}, {"A", 0.008}, {"t", 0.003}, {"lneck", 0.09},
@@ -83,25 +127,45 @@ inline grm::Result body_network_result(double size = 1.0, double top_mm = 2.8, d
     net.add_log("plate rigidity", {{"D", 1}, {"E", -1}, {"h", -3}}, std::log10(BRACING / (12 * (1 - NU_WOOD * NU_WOOD))), 1e-9);
     net.add_log("plate impedance", {{"Zp", 1}, {"D", -0.5}, {"rho", -0.5}, {"h", -0.5}}, std::log10(8.0), 1e-9);
     net.add_log("top mass", {{"Mtop", 1}, {"rho", -1}, {"h", -1}, {"a", -2}}, std::log10(PI), 1e-9);
-    net.add_log("modal mass", {{"Mm", 1}, {"Mtop", -1}}, std::log10(BETA_MODAL), 1e-9);
+    const bool loaded = braces_kg >= 0;
+    if (loaded) {
+        net.add_node("Mbraces", 0.06);
+        net.add_node("Mbridge", 0.03);
+        net.add_node("Mloaded", 0.2);
+        net.add_node("Q", 50.0);
+        net.add_log("bridge block", {{"Mbridge", 1}, {"rhob", -1}, {"Vb", -1}}, 0.0, 1e-9);
+        net.add_sum("loaded top", {{"Mloaded", 1}, {"Mtop", -1}, {"Mbraces", -1}, {"Mbridge", -1}}, 0.0, 1e-9);
+        net.add_log("modal mass", {{"Mm", 1}, {"Mloaded", -1}}, std::log10(BETA_MODAL), 1e-9);
+    } else {
+        net.add_log("modal mass", {{"Mm", 1}, {"Mtop", -1}}, std::log10(BETA_MODAL), 1e-9);
+    }
     net.add_log("bridge mass", {{"mb", 1}, {"rhob", -1}, {"Vb", -1}}, std::log10(BRIDGE_SHARE), 1e-9);
     net.add_log("bridge corner", {{"fb", 1}, {"mb", 1}, {"Zp", -1}}, -std::log10(2 * PI), 1e-9);
     for (int j = 0; j < 5; ++j)
         net.add_log("top mode " + std::to_string(j + 3), {{"f" + std::to_string(j + 3), 1}, {"fT", -1}},
                     std::log10(PLATE_RATIOS[j]), 1e-9);
-    return net.solve({{"V", {0.016 * size * size * size, 0.01}}, {"r", {0.05 * size, 0.01}}, {"t", {0.0028, 0.02}},
-                      {"a", {0.17 * size, 0.01}}, {"h", {top_mm / 1000.0, 0.02}}, {"E", {1.0e10, 0.05}},
-                      {"rho", {430.0, 0.02}}, {"Vb", {BRIDGE_VOLUME, 0.02}}, {"rhob", {RHO_BRIDGE, 0.02}}});
+    std::map<std::string, grm::Measurement> m = {
+        {"V", {0.016 * size * size * size * air, 0.01}}, {"r", {0.05 * size, 0.01}}, {"t", {0.0028, 0.02}},
+        {"a", {0.17 * size, 0.01}}, {"h", {top_m, 0.02}}, {"E", {spec.E, 0.05}},
+        {"rho", {spec.rho, 0.02}}, {"Vb", {BRIDGE_VOLUME, 0.02}}, {"rhob", {RHO_BRIDGE, 0.02}}};
+    if (loaded) {
+        m["Mbraces"] = {std::max(braces_kg, 1e-4), 0.02};
+        m["Q"] = {q, 0.02};
+    }
+    return net.solve(m);
 }
 
-inline Body body_network(double size = 1.0, double top_mm = 2.8, double coupling = 0.35) {
-    const auto r = body_network_result(size, top_mm, coupling);
+inline Body body_network(const BodySpec& spec) {
+    const auto r = body_network_result(spec);
+    const double hollow = std::min(std::max(spec.hollow, 0.0), 1.0);
     Body b;
     b.f = {r["f_lo"], r["f_hi"], r["f3"], r["f4"], r["f5"], r["f6"], r["f7"]};
     for (int m = 0; m < 7; ++m) {
         b.gain[(size_t) m] = MODE_GAINS[m];
-        b.q[(size_t) m] = MODE_QS[m];
+        b.q[(size_t) m] = spec.braces_kg >= 0 ? r["Q"] : MODE_QS[m];
     }
+    // the air mode (the cavity breathing through the hole) fades with the cavity: none in a solid body
+    if (hollow < 1.0) b.gain[0] *= hollow;
     b.Mm = r["Mm"];
     b.Zp = r["Zp"];
     b.mb = r["mb"];
@@ -112,6 +176,17 @@ inline Body body_network(double size = 1.0, double top_mm = 2.8, double coupling
     b.f_hi = r["f_hi"];
     b.fb = r["fb"];
     return b;
+}
+
+inline Body body_network(double size = 1.0, double top_mm = 2.8, double coupling = 0.35, double braces_kg = -1.0,
+                         double q = BODY_Q) {
+    BodySpec b;
+    b.size = size;
+    b.top_mm = top_mm;
+    b.coupling = coupling;
+    b.braces_kg = braces_kg;
+    b.q = q;
+    return body_network(b);
 }
 
 // Impulse response of the body seen as radiation: Y(f) * i ka / (1 + i ka). Normalised so that its
@@ -140,6 +215,77 @@ inline std::vector<double> body_impulse(const Body& b, double sr, size_t length 
         ir[i] = H[i].real() * scale * fade;
     }
     return ir;
+}
+
+// ============================================================ magnetic pickup
+// The coil (inductance L, resistance R, its own capacitance) loaded by the cable and the volume pot with the
+// amplifier: V_out / V_coil = 1 / (L C s^2 + (R C + L / Rload) s + 1 + R / Rload), C = coil + cable.
+// Measured pickups (ozvalveamps.org, after H. Lemme): a 1970s Stratocaster single coil 2.2 H, 6.5 kOhm, 110 pF;
+// the average of 21 pickups measured by Lemme 4.1 H, 12 kOhm, 130 pF (a hotter, humbucker-like pickup).
+struct PickupType { const char* name; double L, R, C; };
+constexpr PickupType PICKUP_TYPES[] = {{"Single coil (Strat 70s)", 2.2, 6.5e3, 110e-12},
+                                       {"Hot (Lemme average)", 4.1, 12e3, 130e-12}};
+constexpr double PICKUP_LOAD = 1.0 / (1.0 / 250e3 + 1.0 / 1e6);   // a 250k volume pot and a 1M amplifier input
+
+// a pickup's output (string velocity in m/s through the circuit) against the force on the bridge (N): a level
+// match so that switching sensor does not jump in loudness (calibrated on the demo song; not physics)
+constexpr double PICKUP_LEVEL = 1.0, PIEZO_LEVEL = 2.8;
+
+struct PickupCircuit {
+    double L = 2.2, R = 6.5e3, C = 610e-12, Rload = PICKUP_LOAD, fr = 4000.0, Q = 1.0;
+};
+
+inline PickupCircuit pickup_network(int type, double cable_pf) {
+    const auto& t = PICKUP_TYPES[std::min(std::max(type, 0), 1)];
+    grm::Network net;
+    for (auto [n, v] : {std::pair<const char*, double>{"L", 2.0}, {"R", 6e3}, {"Cc", 1e-10}, {"Ck", 5e-10}, {"C", 6e-10},
+                        {"Rl", 2e5}, {"fr", 4000.0}})
+        net.add_node(n, v);
+    net.add_node("Q", 1.0);
+    const int iL = net.index("L"), iR = net.index("R"), iC = net.index("C"), iRl = net.index("Rl"), iQ = net.index("Q");
+    net.add_sum("capacitance", {{"C", 1}, {"Cc", -1}, {"Ck", -1}}, 0.0, 1e-15);
+    net.add_log("resonance", {{"fr", 1}, {"L", 0.5}, {"C", 0.5}}, -std::log10(2 * PI), 1e-9);
+    // Q of the denominator: sqrt(L C (1 + R / Rl)) / (R C + L / Rl)
+    net.add_fn("damping", {"Q", "L", "R", "C", "Rl"}, [=](const grm::Values& v) {
+        const double q = std::sqrt(v[iL] * v[iC] * (1 + v[iR] / v[iRl])) / (v[iR] * v[iC] + v[iL] / v[iRl]);
+        return std::log10(v[iQ]) - std::log10(q);
+    }, 1e-9);
+    const auto r = net.solve({{"L", {t.L, 0.02}}, {"R", {t.R, 0.01}}, {"Cc", {t.C, 0.05}},
+                              {"Ck", {std::max(cable_pf, 1.0) * 1e-12, 0.05}}, {"Rl", {PICKUP_LOAD, 0.02}}});
+    PickupCircuit c;
+    c.L = r["L"];
+    c.R = r["R"];
+    c.C = r["C"];
+    c.Rload = r["Rl"];
+    c.fr = r["fr"];
+    c.Q = r["Q"];
+    return c;
+}
+
+// the circuit as a digital filter (bilinear transform, warped at the resonance)
+struct Biquad {
+    double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0;
+    double process(double x) {
+        const double y = b0 * x + z1;
+        z1 = b1 * x - a1 * y + z2;
+        z2 = b2 * x - a2 * y;
+        return y;
+    }
+};
+
+inline Biquad pickup_filter(const PickupCircuit& c, double sr) {
+    // H(s) = 1 / (A2 s^2 + A1 s + A0)
+    const double A2 = c.L * c.C, A1 = c.R * c.C + c.L / c.Rload, A0 = 1.0 + c.R / c.Rload;
+    const double w = 2 * PI * std::min(c.fr, 0.45 * sr);
+    const double K = w / std::tan(w / (2 * sr));
+    const double d0 = A2 * K * K + A1 * K + A0, d1 = 2 * (A0 - A2 * K * K), d2 = A2 * K * K - A1 * K + A0;
+    Biquad f;
+    f.b0 = 1.0 / d0;
+    f.b1 = 2.0 / d0;
+    f.b2 = 1.0 / d0;
+    f.a1 = d1 / d0;
+    f.a2 = d2 / d0;
+    return f;
 }
 
 // ============================================================ palm

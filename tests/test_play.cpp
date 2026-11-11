@@ -67,15 +67,15 @@ int main() {
     }
 
     // ---- a damped note darkens as it dies: the high modes go faster than the fundamental
+    // (the string alone: the open strings answering through the bridge keep their own colour)
     {
-        Engine e;
-        e.prepare(sr);
-        e.set_model(model.get());
+        auto alone = std::make_shared<Model>(*model);
+        alone->s.sympathy = false;
         Transport tr;
         auto ratio = [&](bool damped) {
             Engine g;
             g.prepare(sr);
-            g.set_model(model.get());
+            g.set_model(alone.get());
             g.pluck_string(1, 5, 0.8);
             std::vector<float> y(256 * 200);
             for (size_t p = 0; p < y.size(); p += 256) {
@@ -216,6 +216,71 @@ int main() {
         ok("live palm: the roll's notes are muted", play(true) < 0.6 * play(false));
     }
 
+    // ---- the loop's flags: in a loop only the part between them plays, from its start
+    {
+        Song song;
+        song.bars = 4;
+        for (int bar = 0; bar < 4; ++bar) {
+            RollNote n;
+            n.string = 1;
+            n.fret = bar;
+            n.start = 4.0 * bar;
+            n.length = 2.0;
+            song.notes.push_back(n);
+        }
+        song.loop_start = 8.0;
+        song.loop_end = 12.0;
+        Song back;
+        ok("loop: the flags are saved with the song", back.from_text(song.to_text()) && back.loop_start == 8.0 && back.loop_end == 12.0);
+        Compiler c;
+        CompileOptions o;
+        o.loop = true;
+        auto perf = compile_song(c, song, model, o);
+        bool only_third = true;
+        int strikes = 0;
+        for (const auto& e : perf->events)
+            if (e.type == EventType::pluck && e.pluck.kind == Kind::strike) {
+                ++strikes;
+                only_third = only_third && e.pluck.fret == 2;
+            }
+        ok("loop: only the notes between the flags play", strikes == 1 && only_third);
+        ok("loop: the performance starts at the start flag", perf->origin == 8.0 && std::abs(perf->length_beats - 4.0) < 1e-9);
+        o.loop = false;
+        auto whole = compile_song(c, song, model, o);
+        int all = 0;
+        for (const auto& e : whole->events) all += e.type == EventType::pluck && e.pluck.kind == Kind::strike;
+        ok("no loop: the whole song plays", all == 4 && whole->origin == 0.0);
+        // writing past the end makes the song longer
+        RollNote far;
+        far.start = 30.0;
+        song.notes.push_back(far);
+        song.fit_content();
+        ok("writing past the end makes the song longer", song.bars == 8);
+    }
+    // ---- one more note: refused only where the hands cannot reach (the roll greys those places)
+    {
+        Song song;
+        RollNote held;
+        held.string = 0;
+        held.fret = 3;
+        held.start = 0.0;
+        held.length = 4.0;
+        song.notes.push_back(held);
+        RollNote far = held, near = held;
+        far.string = 1;
+        far.fret = 8;
+        far.start = 1.0;
+        far.length = 1.0;
+        near.string = 1;
+        near.fret = 5;
+        near.start = 1.0;
+        near.length = 1.0;
+        ok("one more note: fret 8 beside fret 3 is out of reach", !playable_with(song, far, true));
+        ok("one more note: fret 5 beside fret 3 is in reach", playable_with(song, near, true));
+        RollNote after = far;
+        after.start = 4.0;                    // fret 3 is released by then
+        ok("one more note: once the hand is free, fret 8 is fine", playable_with(song, after, true));
+    }
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

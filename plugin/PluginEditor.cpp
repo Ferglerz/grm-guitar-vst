@@ -130,12 +130,16 @@ void ScopeView::paint(juce::Graphics& g) {
 }
 
 // ================================================================== parameters
-ParamPanel::ParamPanel(juce::AudioProcessorValueTreeState& state, const std::vector<const char*>& ids) {
-    for (const char* id : ids) {
+ParamPanel::ParamPanel(juce::AudioProcessorValueTreeState& state, const std::vector<juce::String>& ids) {
+    for (const auto& id : ids) {
         auto* param = state.getParameter(id);
         if (!param) continue;
         Row r;
-        r.label = std::make_unique<juce::Label>(juce::String(), param->getName(64));
+        // the name without the guitar it belongs to ("G2 Tuning": the panel already shows guitar 2)
+        juce::String name = param->getName(64);
+        if (name.startsWithChar('G') && name.indexOfChar(' ') > 1 && name.substring(1, name.indexOfChar(' ')).containsOnly("0123456789"))
+            name = name.fromFirstOccurrenceOf(" ", false, false);
+        r.label = std::make_unique<juce::Label>(juce::String(), name);
         r.label->setFont(font(13.0f));
         r.label->setColour(juce::Label::textColourId, ui::BRIGHT);
         addAndMakeVisible(*r.label);
@@ -238,19 +242,20 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
 
     addAndMakeVisible(neck);
     addAndMakeVisible(scope);
-    auto addTab = [&](const char* name, std::vector<const char*> ids) {
-        tabs.addTab(name, PANEL, new ParamPanel(processor.params, ids), true);
-    };
-    addTab("Strings", {"tuning", "resonance", "brightness", "core", "stiff"});
-    addTab("Attack & palm", {"attack", "pluck", "force", "pick", "palm_mm", "palm_intensity", "live_palm"});
-    addTab("Body", {"body_size", "top_mm", "coupling", "body_amount", "sympathy"});
-    addTab("Room", {"room_on", "room_size", "room_material", "room_distance"});
-    addTab("Player", {"human", "swing_cm", "finger_noises", "finger_force"});
-    addTab("Playback", {"follow_host", "loop", "tempo", "midi_strings"});
-    tabs.addTab("Networks", ui::PANEL, new NetworksView(processor), true);
     tabs.setTabBarDepth(28);
     tabs.setOutline(0);
     addAndMakeVisible(tabs);
+    addAndMakeVisible(addGuitarButton);
+    addGuitarButton.setTooltip("Another guitar in this plugin (up to 8), with its own settings, patterns and mixer strip");
+    addGuitarButton.onClick = [this] { processor.addGuitar(); };
+    addAndMakeVisible(removeGuitarButton);
+    removeGuitarButton.setTooltip("Remove the selected guitar (the ones after it move down)");
+    removeGuitarButton.onClick = [this] { processor.removeGuitar(processor.getSelectedGuitar()); };
+    addAndMakeVisible(ghostsButton);
+    ghostsButton.setTooltip("Show the notes of the other guitars, faint, behind this guitar's roll");
+    ghostsButton.setColour(juce::ToggleButton::textColourId, TEXT);
+    ghostsAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(processor.params, "ghosts", ghostsButton);
+    rebuildGuitars();
 
     addAndMakeVisible(playButton);
     playButton.onClick = [this] { togglePlay(); };
@@ -297,19 +302,19 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
     for (int b : {1, 2, 4, 8, 12, 16, 24, 32, 48, 64}) barsBox.addItem(juce::String(b) + " bars", b);
     barsBox.onChange = [this] {
         const int b = barsBox.getSelectedId();
-        if (b > 0 && b != roll.getSong().bars) roll.edit([b](Song& s) { s.bars = b; });
+        if (b > 0 && b != roll.getSong().bars) roll.edit([b](Song& s) { s.bars = b; }, false);
     };
     for (int b : {1, 2, 4, 8}) fillCount.addItem("x " + juce::String(b), b);
     fillCount.setSelectedId(1, juce::dontSendNotification);
     fillStrums.onClick = [this] {
         const int bar = roll.currentBar, count = std::max(1, fillCount.getSelectedId()), pattern = strumBox.getSelectedId() - 1;
         const int chord = roll.chord;
-        roll.edit([=](Song& s) { s.fill_strums(bar, std::min(count, s.bars - bar), pattern, chord, 2.0); });
+        roll.edit([=](Song& s) { s.fill_strums(bar, std::min(count, grmg::Song::MAX_BARS - bar), pattern, chord, 2.0); });
     };
     fillArp.onClick = [this] {
         const int bar = roll.currentBar, count = std::max(1, fillCount.getSelectedId()), pattern = arpBox.getSelectedId() - 1;
         const int chord = roll.chord;
-        roll.edit([=](Song& s) { s.fill_arpeggio(bar, std::min(count, s.bars - bar), pattern, chord, 2.0); });
+        roll.edit([=](Song& s) { s.fill_arpeggio(bar, std::min(count, grmg::Song::MAX_BARS - bar), pattern, chord, 2.0); });
     };
     clearBar.onClick = [this] {
         const int bar = roll.currentBar;
@@ -320,7 +325,7 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
     demoButton.onClick = [this] { roll.edit([](Song& s) { s = Song::demo(); }); };
     chordLabel.setText("Chord", juce::dontSendNotification);
     snapLabel.setText("Snap", juce::dontSendNotification);
-    songLabel.setText("Song", juce::dontSendNotification);
+    songLabel.setText("Length", juce::dontSendNotification);
     for (auto* c : std::initializer_list<juce::Component*> {&chordBox, &strumBox, &arpBox, &snapBox, &barsBox, &fillCount,
                                                              &fillStrums, &fillArp, &clearBar, &undoButton, &redoButton,
                                                              &demoButton, &chordLabel, &barLabel, &snapLabel, &songLabel, &help})
@@ -334,6 +339,39 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
                  "Wheel or digits: fret.  P: palm.  Del: delete.  Ctrl+wheel: zoom.  Space: play.",
                  juce::dontSendNotification);
     help.setFont(font(11.0f));
+    // ---------------------------------------------------------------- patterns
+    patternLabel.setText("Pattern", juce::dontSendNotification);
+    midiLabel.setText("MIDI keys", juce::dontSendNotification);
+    patternBox.onChange = [this] {
+        const int k = patternBox.getSelectedId() - 1;
+        if (k >= 0) processor.selectPattern(k);
+    };
+    newPattern.setTooltip("A new empty pattern after this one");
+    newPattern.onClick = [this] { processor.addPattern(false); };
+    duplicatePattern.setTooltip("A copy of this pattern after it");
+    duplicatePattern.onClick = [this] { processor.addPattern(true); };
+    deletePatternButton.setTooltip("Delete this pattern");
+    deletePatternButton.onClick = [this] { processor.deletePattern(); };
+    copyPatternButton.setTooltip("Copy this pattern (paste it into any guitar, or another instance)");
+    copyPatternButton.onClick = [this] { processor.copyPattern(); };
+    pastePatternButton.setTooltip("Paste the copied pattern as a new pattern after this one");
+    pastePatternButton.onClick = [this] { processor.pastePattern(); };
+    midiModeBox.addItemList({"Play notes", "Play patterns"}, 1);
+    midiModeBox.setTooltip("Play notes: a key plays a note on the guitar. Play patterns: a key plays a whole pattern "
+                           "(C1 pattern 1, C#1 pattern 2...), looped while the key is held");
+    midiModeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(processor.params, "midi_mode", midiModeBox);
+    followButton.setTooltip("The roll scrolls with the playhead. Off: it stays where you are editing");
+    followAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(processor.params, "follow_playhead", followButton);
+    for (auto* c : std::initializer_list<juce::Component*> {&patternLabel, &patternBox, &newPattern, &duplicatePattern,
+                                                             &deletePatternButton, &copyPatternButton, &pastePatternButton, &midiLabel, &midiModeBox, &keyHint, &followButton})
+        addAndMakeVisible(c);
+    for (auto* l : {&patternLabel, &midiLabel, &keyHint}) {
+        l->setColour(juce::Label::textColourId, TEXT);
+        l->setFont(font(12.0f));
+    }
+    followButton.setColour(juce::ToggleButton::textColourId, TEXT);
+    refreshPatterns();
+
     roll.onPlayToggle = [this] { togglePlay(); };
     roll.onChanged = [this] { refreshTools(); };
     addAndMakeVisible(roll);
@@ -348,8 +386,151 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
 GRMGuitarEditor::~GRMGuitarEditor() { setLookAndFeel(nullptr); }
 
 void GRMGuitarEditor::refreshTools() {
-    barsBox.setSelectedId(roll.getSong().bars, juce::dontSendNotification);
+    const int bars = roll.getSong().bars;
+    if (barsBox.indexOfItemId(bars) < 0) barsBox.addItem(juce::String(bars) + " bars", bars);   // grown by writing
+    barsBox.setSelectedId(bars, juce::dontSendNotification);
     barLabel.setText("Bar " + juce::String(roll.currentBar + 1), juce::dontSendNotification);
+}
+
+void GRMGuitarEditor::rebuildGuitars() {
+    using namespace ui;
+    shownGuitarVersion = processor.getGuitarVersion();
+    const int count = processor.getGuitarCount(), sel = processor.getSelectedGuitar();
+    guitarButtons.clear();
+    for (int g = 0; g < count; ++g) {
+        auto b = std::make_unique<juce::TextButton>(processor.getGuitarName(g));
+        b->setClickingTogglesState(false);
+        b->setToggleState(g == sel, juce::dontSendNotification);
+        b->setColour(juce::TextButton::buttonOnColourId, WAVE.darker(0.4f));
+        b->onClick = [this, g] { processor.selectGuitar(g); };
+        addAndMakeVisible(*b);
+        guitarButtons.push_back(std::move(b));
+    }
+    addGuitarButton.setEnabled(count < GRMGuitarProcessor::MAX_GUITARS);
+    removeGuitarButton.setEnabled(count > 1);
+    // the settings tabs of the selected guitar (the plugin's own settings stay in Playback)
+    const int shownTab = juce::jmax(0, tabs.getCurrentTabIndex());
+    tabs.clearTabs();
+    auto addTab = [&](const char* name, std::vector<const char*> ids, bool ownGuitar = true) {
+        std::vector<juce::String> full;
+        for (auto* id : ids) full.push_back(ownGuitar ? processor.paramId(id) : juce::String(id));
+        tabs.addTab(name, PANEL, new ParamPanel(processor.params, full), true);
+    };
+    addTab("Strings", {"tuning", "string_age", "brightness", "core", "stiff"});
+    addTab("Attack & palm", {"attack", "pluck", "force", "pick", "palm_mm", "palm_intensity", "live_palm"});
+    addTab("Body", {"hollow", "wood", "density_pct", "body_size", "top_mm", "braces_g", "body_q", "coupling", "body_amount", "sympathy"});
+    addTab("Sensor", {"sensor", "pickup_mm", "pickup_type", "cable_pf"});
+    addTab("Room", {"room_on", "room_size", "room_material", "room_distance"});
+    addTab("Player", {"human", "swing_cm", "finger_noises", "finger_force"});
+    tabs.addTab("Mixer", PANEL, new MixerView(processor), true);
+    addTab("Playback", {"follow_host", "loop", "tempo", "midi_strings", "midi_route"}, false);
+    tabs.addTab("Networks", PANEL, new NetworksView(processor), true);
+    tabs.setCurrentTabIndex(juce::jmin(shownTab, tabs.getNumTabs() - 1), false);
+    resized();
+}
+
+// ================================================================== mixer
+MixerView::MixerView(GRMGuitarProcessor& p) : processor(p) {
+    rebuild();
+    startTimerHz(10);
+}
+
+void MixerView::timerCallback() {
+    if (processor.getGuitarCount() != shownCount || processor.getSelectedGuitar() != shownSelected) rebuild();
+}
+
+void MixerView::rebuild() {
+    using Att = juce::AudioProcessorValueTreeState;
+    strips.clear();
+    shownCount = processor.getGuitarCount();
+    shownSelected = processor.getSelectedGuitar();
+    for (int g = 0; g < shownCount; ++g) {
+        Strip s;
+        auto id = [g](const char* k) { return GuitarTrack::paramId(g, k); };
+        s.name = std::make_unique<juce::TextButton>(processor.getGuitarName(g));
+        s.name->setToggleState(g == shownSelected, juce::dontSendNotification);
+        s.name->setColour(juce::TextButton::buttonOnColourId, ui::WAVE.darker(0.4f));
+        s.name->onClick = [this, g] { processor.selectGuitar(g); };
+        s.gain = std::make_unique<juce::Slider>(juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow);
+        s.level = std::make_unique<juce::Slider>(juce::Slider::LinearVertical, juce::Slider::TextBoxBelow);
+        s.pan = std::make_unique<juce::Slider>(juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow);
+        for (auto* sl : {s.gain.get(), s.level.get(), s.pan.get()}) sl->setTextBoxStyle(juce::Slider::TextBoxBelow, false, 54, 16);
+        s.gain->setTooltip("Gain (dB)");
+        s.pan->setTooltip("Pan");
+        s.level->setTooltip("Level");
+        s.mute = std::make_unique<juce::ToggleButton>("M");
+        s.solo = std::make_unique<juce::ToggleButton>("S");
+        s.out = std::make_unique<juce::ComboBox>();
+        s.out->addItemList({"Main", "Own output"}, 1);
+        s.out->setTooltip("Main: the plugin's main output. Own output: this guitar's output (enable it in the host)");
+        s.gainA = std::make_unique<Att::SliderAttachment>(processor.params, id("mix_gain"), *s.gain);
+        s.levelA = std::make_unique<Att::SliderAttachment>(processor.params, id("mix_level"), *s.level);
+        s.panA = std::make_unique<Att::SliderAttachment>(processor.params, id("mix_pan"), *s.pan);
+        s.muteA = std::make_unique<Att::ButtonAttachment>(processor.params, id("mix_mute"), *s.mute);
+        s.soloA = std::make_unique<Att::ButtonAttachment>(processor.params, id("mix_solo"), *s.solo);
+        s.outA = std::make_unique<Att::ComboBoxAttachment>(processor.params, id("mix_out"), *s.out);
+        for (juce::Component* c : std::initializer_list<juce::Component*> {s.name.get(), s.gain.get(), s.level.get(), s.pan.get(),
+                                                                            s.mute.get(), s.solo.get(), s.out.get()})
+            addAndMakeVisible(c);
+        strips.push_back(std::move(s));
+    }
+    resized();
+    repaint();
+}
+
+void MixerView::paint(juce::Graphics& g) {
+    g.fillAll(ui::PANEL);
+    g.setColour(ui::GRID);
+    const int w = 96;
+    for (size_t k = 1; k < strips.size(); ++k) g.drawVerticalLine((int) k * w, 4.0f, (float) getHeight() - 4.0f);
+    g.setColour(ui::TEXT);
+    g.setFont(juce::Font(juce::FontOptions(10.0f)));
+    for (const auto& s : strips) {
+        g.drawText("gain dB", s.gain->getBounds().withHeight(11).translated(0, -2), juce::Justification::centredLeft);
+        g.drawText("pan", s.pan->getBounds().withHeight(11).translated(0, -2), juce::Justification::centredLeft);
+        g.drawText("level", s.level->getBounds().withHeight(11).translated(0, -2), juce::Justification::centredRight);
+    }
+}
+
+void MixerView::resized() {
+    const int w = 96;
+    for (size_t k = 0; k < strips.size(); ++k) {
+        auto a = juce::Rectangle<int>((int) k * w, 0, w, getHeight()).reduced(4);
+        auto& s = strips[k];
+        s.name->setBounds(a.removeFromTop(22));
+        a.removeFromTop(10);                   // room for the labels
+        s.out->setBounds(a.removeFromBottom(22));
+        auto ms = a.removeFromBottom(22);
+        s.mute->setBounds(ms.removeFromLeft(ms.getWidth() / 2));
+        s.solo->setBounds(ms);
+        auto knobs = a.removeFromLeft(a.getWidth() / 2);
+        s.gain->setBounds(knobs.removeFromTop(knobs.getHeight() / 2));
+        s.pan->setBounds(knobs);
+        s.level->setBounds(a);
+    }
+}
+
+void GRMGuitarEditor::refreshPatterns() {
+    const int count = processor.getPatternCount(), k = processor.getEditingPattern();
+    if (count != shownPatterns) {
+        patternBox.clear(juce::dontSendNotification);
+        for (int i = 0; i < count; ++i)
+            patternBox.addItem(juce::String(i + 1) + "   (key " + GRMGuitarProcessor::patternKeyName(i) + ")", i + 1);
+        shownPatterns = count;
+        shownEditing = -1;
+    }
+    if (k != shownEditing) {
+        patternBox.setSelectedId(k + 1, juce::dontSendNotification);
+        shownEditing = k;
+    }
+    deletePatternButton.setEnabled(count > 1);
+    newPattern.setEnabled(count < GRMGuitarProcessor::MAX_PATTERNS);
+    duplicatePattern.setEnabled(count < GRMGuitarProcessor::MAX_PATTERNS);
+    const bool patterns = processor.params.getRawParameterValue("midi_mode")->load() > 0.5f;
+    keyHint.setText(patterns ? "key " + GRMGuitarProcessor::patternKeyName(0) + " = pattern 1, "
+                                   + GRMGuitarProcessor::patternKeyName(1) + " = pattern 2..."
+                             : "keys play notes on the guitar",
+                    juce::dontSendNotification);
 }
 
 void GRMGuitarEditor::togglePlay() {
@@ -358,17 +539,23 @@ void GRMGuitarEditor::togglePlay() {
 
 void GRMGuitarEditor::timerCallback() {
     status.setText(processor.getStatus(), juce::dontSendNotification);
+    if (processor.getGuitarVersion() != shownGuitarVersion) rebuildGuitars();
+    refreshPatterns();
+    pastePatternButton.setEnabled(processor.hasCopiedPattern()
+                                  || juce::SystemClipboard::getTextFromClipboard().startsWith("grm-guitar-roll"));
     const bool host = processor.isHostPlaying();
     playButton.setButtonText(processor.isInternalPlaying() ? "Stop" : "Play");
     playButton.setEnabled(!host);
     exportButton.setEnabled(!processor.isExporting());
     const double b = processor.getShownBeat();
     const auto& s = roll.getSong();
-    if (b >= 0) {
+    const int playing = processor.getPlayingPattern();
+    if (b >= 0 && playing >= 0) {
         const int bar = (int) (b / s.beats_per_bar);
         const double beat = b - bar * s.beats_per_bar;
-        position.setText(juce::String(bar + 1) + "." + juce::String((int) beat + 1) + (host ? "  (host)" : ""),
-                         juce::dontSendNotification);
+        const juce::String where = playing == processor.getEditingPattern() ? juce::String(bar + 1) + "." + juce::String((int) beat + 1)
+                                                                             : juce::String("P") + juce::String(playing + 1);
+        position.setText(where + (host ? "  (host)" : ""), juce::dontSendNotification);
     } else {
         position.setText("-", juce::dontSendNotification);
     }
@@ -403,7 +590,18 @@ void GRMGuitarEditor::resized() {
     status.setBounds(header.removeFromRight(juce::jmin(260, juce::jmax(0, header.getWidth() - 150))));
     subtitleWidth = juce::jmax(0, header.getWidth() - 150);
 
-    auto top = area.removeFromTop(juce::jmax(260, area.getHeight() * 38 / 100)).reduced(8, 4);
+    {
+        auto bar = area.removeFromTop(28).reduced(8, 2);
+        for (auto& b : guitarButtons) {
+            b->setBounds(bar.removeFromLeft(84));
+            bar.removeFromLeft(4);
+        }
+        bar.removeFromLeft(6);
+        addGuitarButton.setBounds(bar.removeFromLeft(80));
+        bar.removeFromLeft(4);
+        removeGuitarButton.setBounds(bar.removeFromLeft(70));
+    }
+    auto top = area.removeFromTop(juce::jmax(250, area.getHeight() * 36 / 100)).reduced(8, 4);
     auto right = top.removeFromRight(top.getWidth() * 46 / 100);
     neck.setBounds(right.removeFromTop(right.getHeight() * 64 / 100));
     right.removeFromTop(6);
@@ -436,6 +634,27 @@ void GRMGuitarEditor::resized() {
     undoButton.setBounds(tools.removeFromRight(52));
     tools.removeFromRight(6);
     demoButton.setBounds(tools.removeFromRight(84));
+
+    auto row = area.removeFromTop(30).reduced(8, 3);
+    patternLabel.setBounds(row.removeFromLeft(50));
+    patternBox.setBounds(row.removeFromLeft(150));
+    row.removeFromLeft(4);
+    newPattern.setBounds(row.removeFromLeft(48));
+    row.removeFromLeft(4);
+    duplicatePattern.setBounds(row.removeFromLeft(74));
+    row.removeFromLeft(4);
+    deletePatternButton.setBounds(row.removeFromLeft(56));
+    row.removeFromLeft(4);
+    copyPatternButton.setBounds(row.removeFromLeft(48));
+    row.removeFromLeft(4);
+    pastePatternButton.setBounds(row.removeFromLeft(50));
+    row.removeFromLeft(14);
+    midiLabel.setBounds(row.removeFromLeft(66));
+    midiModeBox.setBounds(row.removeFromLeft(120));
+    row.removeFromLeft(8);
+    followButton.setBounds(row.removeFromRight(130));
+    ghostsButton.setBounds(row.removeFromRight(120));
+    keyHint.setBounds(row);
 
     help.setBounds(area.removeFromBottom(20).reduced(10, 0));
     roll.setBounds(area.reduced(8, 2));

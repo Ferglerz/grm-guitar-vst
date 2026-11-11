@@ -50,7 +50,7 @@ struct Settings {
     int tuning = 0;
     double core = 0.45;          // steel core share of the wound strings
     bool stiff = true;           // inharmonicity from the stiffness network
-    double resonance = 3.0;      // s, losses inside the string and the air ("damping" of the Python app)
+    double string_age = 0.0;     // 0 new strings, 1 played strings (the losses network, Woodhouse 2012)
     double brightness = 0.6;
     // attack
     bool pick = true;
@@ -62,6 +62,16 @@ struct Settings {
     double palm_intensity = 1.0;  // 0 (below PALM_OFF): the palm does not touch the strings at all
     // body
     double body_size = 1.0, top_mm = 2.8, coupling = 0.35, body_amount = 0.85;
+    double braces_g = BRACES_KG * 1000;   // braces under the top (with the bridge: the top's own load)
+    double body_q = BODY_Q;               // how long the body's modes ring (Q of each mode)
+    int wood = 0;                         // WOODS: the top's (or the solid body's) wood
+    double density_pct = 0.0;             // the piece of wood against its species' average density (%)
+    double hollow = 1.0;                  // 1 a hollow acoustic body, 0 a solid body
+    // what listens to the guitar
+    int sensor = 0;                       // 0 a microphone (body and room), 1 a magnetic pickup, 2 a piezo under the saddle
+    double pickup_mm = 100.0;             // magnetic pickup: distance from the saddle
+    int pickup_type = 0;                  // PICKUP_TYPES
+    double cable_pf = 500.0;              // cable capacitance
     bool sympathy = true;
     // room
     bool room_on = true;
@@ -79,12 +89,26 @@ struct Place {
     double f1 = 0, B = 0, T = 0, Leff = 0, c = 0, Zs = 0;
 };
 
+// The losses of one string (string_losses_network): the decay rate of each partial, from the string itself and
+// the air around it (the bridge and the palm add theirs)
+struct StringLosses {
+    double etaF = 0, etaA = 0, etaB = 0;
+    double legacy = 0;      // > 0: the curve of the Python app, (1 + (f / 1800)^2) / legacy (parity tests only)
+    // s^-1, partial n at frequency f of a string of inharmonicity B
+    double sigma(double f, int n, double B) const {
+        if (legacy > 0) return (1.0 + (f / 1800.0) * (f / 1800.0)) / legacy;
+        const double w = 2 * PI * f, b = B * n * n;
+        return 0.5 * w * (etaF + etaA / w + etaB * b) / (1.0 + b);
+    }
+};
+
 class Model {
 public:
     Settings s;
     double sample_rate = 48000.0;
     std::array<double, NUM_STRINGS> tension{};                                  // N, from the tuning network
     std::array<std::array<Place, NUM_FRETS>, NUM_STRINGS> place{};
+    std::array<StringLosses, NUM_STRINGS> losses{};
     std::array<std::array<double, NUM_FRETS>, NUM_STRINGS> y0{}, tau{};        // attack at the set force
     std::array<std::array<std::shared_ptr<const Palm>, NUM_FRETS>, NUM_STRINGS> palm{};
     std::array<Action, NUM_FRETS> action{};
@@ -116,7 +140,9 @@ public:
     }
     static bool same_body(const Settings& a, const Settings& b) {
         return std::abs(a.body_size - b.body_size) < 1e-12 && std::abs(a.top_mm - b.top_mm) < 1e-12
-               && std::abs(a.coupling - b.coupling) < 1e-12;
+               && std::abs(a.coupling - b.coupling) < 1e-12 && std::abs(a.braces_g - b.braces_g) < 1e-9
+               && std::abs(a.body_q - b.body_q) < 1e-9 && a.wood == b.wood && std::abs(a.density_pct - b.density_pct) < 1e-9
+               && std::abs(a.hollow - b.hollow) < 1e-9;
     }
     static bool same_room(const Settings& a, const Settings& b) {
         return a.room_size == b.room_size && a.room_material == b.room_material
@@ -132,6 +158,34 @@ public:
     }
     std::pair<double, double> palm_home() const {
         return palm_snap(s.palm_mm / 1000.0, PALM_FORCE * s.palm_intensity);
+    }
+
+    BodySpec body_spec() const {
+        BodySpec b;
+        b.size = s.body_size;
+        b.top_mm = s.top_mm;
+        b.coupling = s.coupling;
+        b.braces_kg = s.braces_g / 1000.0;
+        b.q = s.body_q;
+        const auto& w = WOODS[std::min(std::max(s.wood, 0), NUM_WOODS - 1)];
+        b.rho = w.rho * (1.0 + s.density_pct / 100.0);
+        b.E = w.E;
+        b.hollow = s.hollow;
+        return b;
+    }
+
+    // the pickup's circuit (cheap: solved again with the strings' losses)
+    PickupCircuit pickup;
+    void solve_pickup() { pickup = pickup_network(s.pickup_type, s.cable_pf); }
+    // where the magnetic pickup listens, from the saddle (m); 0 when it does not listen
+    double pickup_x() const { return s.sensor == 1 ? s.pickup_mm / 1000.0 : 0.0; }
+
+    // the losses of the strings at their age (six small networks: cheap enough to solve again on every change)
+    void solve_losses() {
+        for (int i = 0; i < NUM_STRINGS; ++i) {
+            const auto r = string_losses_network(i, s.string_age);
+            losses[(size_t) i] = {r["etaF"], r["etaA"], r["etaB"], 0.0};
+        }
     }
 
     // solve what changed since `previous` (null: everything). `stage` limits the slow parts (palm, room):
@@ -161,6 +215,8 @@ public:
             }
             for (int f = 0; f < NUM_FRETS; ++f) action[(size_t) f] = action_network(STRING_SPECS[0].L, f);
         }
+        solve_losses();
+        solve_pickup();
         if (keep_strings && same_attack(previous->s, s)) {
             y0 = previous->y0;
             tau = previous->tau;
@@ -178,7 +234,7 @@ public:
             body_ir = previous->body_ir;
             body_id = previous->body_id;
         } else {
-            body = body_network(s.body_size, s.top_mm, s.coupling);
+            body = body_network(body_spec());
             const auto ir = body_impulse(body, sr);
             body_ir.assign(ir.begin(), ir.end());
             body_id = next_id();

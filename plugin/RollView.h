@@ -6,6 +6,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -42,7 +43,8 @@ public:
 
     void reload();                 // the processor's song (after a state load)
     const grmg::Song& getSong() const { return song; }
-    void edit(const std::function<void(grmg::Song&)>& change);   // one undoable change
+    // one undoable change; fit: the song grows to hold what was written (not when its length is chosen)
+    void edit(const std::function<void(grmg::Song&)>& change, bool fit = true);
     void undo();
     void redo();
     void zoom(double factor, double aroundBeat);
@@ -66,10 +68,27 @@ private:
     double ppb = 72.0;             // pixels per beat
     double viewBeat = 0.0;         // beat at the left edge
     double lastPlayhead = -1.0;
-    int stateVersion = 0;
+    int stateVersion = 0, patternVersion = 0, pattern = 0, patternCount = 1;
+    // each pattern keeps its own undo history
+    std::map<int, std::pair<std::vector<std::string>, std::vector<std::string>>> histories;
+    double playhead() const;       // the playhead in the pattern shown, -1 if another one plays
+    int historyKey() const;        // the guitar and pattern being edited
+
+    // the other guitars' notes, faint behind this one's (to write in harmony with them)
+    struct Ghost { int guitar; int tuning; grmg::Song song; };
+    std::vector<Ghost> ghosts;
+    long ghostKey = -1;
+    void refreshGhosts();
+
+    // where the hands cannot reach: the places a note of the brush's fret would be refused (computed for the
+    // visible part, again when the song, the brush or the view change)
+    std::vector<juce::Rectangle<float>> blocked;
+    std::string blockedKey;
+    void refreshBlocked();
+    double fittedLength(int string, double start) const;   // a new note: no longer than the room before the next one
     int brushFret[6] = {0, 0, 0, 0, 0, 0};
 
-    enum class Drag { none, move, resize, rect };
+    enum class Drag { none, move, resize, rect, loopStart, loopEnd };
     struct Selection { bool strum = false; int index = -1; } sel;
     Drag drag = Drag::none;
     bool dragChanged = false;
@@ -116,7 +135,8 @@ private:
     void duplicateSelection();
     void showEmptyMenu();
     void pushUndo();
-    void commit(bool checkPlayable = true);   // checkPlayable: refuse a change that adds an impossible moment
+    void commit(bool checkPlayable = true, bool fit = true);   // checkPlayable: refuse a change that adds an impossible moment
+    int loopFlagAt(juce::Point<float> p) const;               // 0 start flag, 1 end flag, -1 none (in the ruler)
     void findProblems();
 
     // what one guitarist cannot play (the hands' constraints, core/playability.hpp)

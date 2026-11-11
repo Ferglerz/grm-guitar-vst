@@ -66,6 +66,7 @@ public:
     std::vector<std::vector<float>> squeaks;                  // force on the bridge (N), at the model's sample rate
     std::vector<std::shared_ptr<const Palm>> palms;           // the palms its plucks point to
     double length_beats = 16.0;
+    double origin = 0.0;          // beat of the song where this performance starts (the loop's start flag)
     double tempo = 90.0;
 
     size_t first_at(double beat) const {
@@ -108,16 +109,19 @@ struct CompileOptions {
     bool loop = false;     // the song plays in a loop: its end leads into its start (hands, ringing notes)
 };
 
+
 class Compiler {
 public:
     PalmCache palms;
 
-    std::unique_ptr<Performance> compile(const Song& song, std::shared_ptr<const Model> model_ptr, const CompileOptions& o) {
+    // length: the beats it lasts (0: the song's bars)
+    std::unique_ptr<Performance> compile(const Song& song, std::shared_ptr<const Model> model_ptr, const CompileOptions& o,
+                                         double length = 0.0) {
         const Model& m = *model_ptr;
         const Settings& s = m.s;
         auto perf = std::make_unique<Performance>();
         perf->model = model_ptr;
-        perf->length_beats = song.length_beats();
+        perf->length_beats = length > 0 ? length : song.length_beats();
         perf->tempo = o.tempo;
         const double spb = 60.0 / o.tempo;               // seconds per beat
         const double step = spb / 4.0;                   // a sixteenth: the half swing of the arm
@@ -552,5 +556,15 @@ private:
         return run_player(grid, step, s, rng);
     }
 };
+
+// what plays: the whole song, or (in a loop) the part between the loop's flags, its end leading into its start
+inline std::unique_ptr<Performance> compile_song(Compiler& compiler, const Song& song, std::shared_ptr<const Model> model,
+                                                 CompileOptions o) {
+    if (!o.loop) return compiler.compile(song, std::move(model), o);
+    const auto [a, b] = song.loop_range();
+    auto perf = compiler.compile(song.section(a, b), std::move(model), o, b - a);
+    perf->origin = a;
+    return perf;
+}
 
 }  // namespace grmg

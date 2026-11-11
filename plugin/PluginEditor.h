@@ -48,7 +48,7 @@ private:
 // the parameters of a group of networks, as rows of sliders, switches and lists
 class ParamPanel : public juce::Component {
 public:
-    ParamPanel(juce::AudioProcessorValueTreeState& state, const std::vector<const char*>& ids);
+    ParamPanel(juce::AudioProcessorValueTreeState& state, const std::vector<juce::String>& ids);
     void resized() override;
 
 private:
@@ -72,6 +72,30 @@ private:
     GRMGuitarProcessor& processor;
     juce::TextEditor text;
     const void* shown = nullptr;
+    void timerCallback() override;
+};
+
+// the mixer: one strip per guitar (gain, level, pan, mute, solo, output); a click on a name selects that guitar
+class MixerView : public juce::Component, private juce::Timer {
+public:
+    explicit MixerView(GRMGuitarProcessor& p);
+    void resized() override;
+    void paint(juce::Graphics&) override;
+
+private:
+    GRMGuitarProcessor& processor;
+    struct Strip {
+        std::unique_ptr<juce::TextButton> name;
+        std::unique_ptr<juce::Slider> gain, level, pan;
+        std::unique_ptr<juce::ToggleButton> mute, solo;
+        std::unique_ptr<juce::ComboBox> out;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> gainA, levelA, panA;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> muteA, soloA;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> outA;
+    };
+    std::vector<Strip> strips;
+    int shownCount = -1, shownSelected = -1;
+    void rebuild();
     void timerCallback() override;
 };
 
@@ -102,6 +126,25 @@ private:
     juce::TextButton fillStrums {"Fill strums"}, fillArp {"Fill arpeggio"}, clearBar {"Clear bar"}, undoButton {"Undo"},
         redoButton {"Redo"}, demoButton {"Demo song"};
     juce::Label chordLabel, barLabel, snapLabel, songLabel, help;
+
+    // patterns: which one is edited, and how MIDI keys play them
+    juce::ComboBox patternBox, midiModeBox;
+    juce::TextButton newPattern {"New"}, duplicatePattern {"Duplicate"}, deletePatternButton {"Delete"},
+        copyPatternButton {"Copy"}, pastePatternButton {"Paste"};
+
+    // the guitars: one button each, add, remove
+    std::vector<std::unique_ptr<juce::TextButton>> guitarButtons;
+    juce::TextButton addGuitarButton {"+ Guitar"}, removeGuitarButton {"Remove"};
+    juce::ToggleButton ghostsButton {"Other guitars"};
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> ghostsAttachment;
+    int shownGuitarVersion = -1;
+    void rebuildGuitars();                     // the guitar buttons and the settings tabs of the selected guitar
+    juce::ToggleButton followButton {"Follow playhead"};
+    juce::Label patternLabel, midiLabel, keyHint;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> midiModeAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> followAttachment;
+    int shownPatterns = -1, shownEditing = -1;
+    void refreshPatterns();
     int subtitleWidth = 420;
 
     void timerCallback() override;

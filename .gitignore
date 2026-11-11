@@ -6,4 +6,3 @@ out/
 CMakeUserPresets.json
 *.wav
 __pycache__/
-RELEASE_NOTES.md

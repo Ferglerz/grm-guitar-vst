@@ -61,6 +61,44 @@ inline grm::Result tune_string_model(double L, double mu, double target, double 
     return net.solve({{"L", {L, dex(SIGMA_L / L)}}, {"mu", {mu, dex(SIGMA_MU_REL)}}, {"f1", {target, 1e-9}}});
 }
 
+// ---------------------------------------------------------------- the losses of a string
+// Woodhouse, "Perceptual thresholds for acoustical guitar models", Acta Acustica 2012, Table I: steel strings,
+// a new set and the same set played. Three losses per string, each with a physical cause:
+//   etaF  inside the string (friction of the steel, of the windings), a loss factor
+//   etaA  the air around the string (viscous drag), in 1/s: it weighs on the low partials
+//   etaB  inside the steel when it bends: it weighs on the high partials, through the stiffness B n^2
+// loss factor of mode n:  eta_n = (etaF + etaA / w_n + etaB B n^2) / (1 + B n^2),  decay rate  w_n eta_n / 2
+// Index 0 = string 6 (low E). Woodhouse's G was wound; the G here is plain, so it takes his B string (plain,
+// the nearest gauge).
+struct MeasuredLosses { double etaF, etaA, etaB; };
+constexpr MeasuredLosses LOSSES_NEW[6] = {{5e-5, 1.7, 0.3e-2}, {11e-5, 1.2, 0.4e-2}, {9e-5, 1.3, 1.1e-2},
+                                          {6e-5, 1.0, 1.1e-2}, {6e-5, 1.0, 1.1e-2}, {7e-5, 2.5, 0.7e-2}};
+constexpr MeasuredLosses LOSSES_PLAYED[6] = {{10e-5, 1.4, 3.8e-2}, {17e-5, 0.6, 2.9e-2}, {33e-5, 0.7, 4.1e-2},
+                                             {7e-5, 1.0, 1.1e-2}, {7e-5, 1.0, 1.1e-2}, {6e-5, 1.5, 0.7e-2}};
+// their spread: the fits of Table I, and a factor 2 to 3 between listeners' thresholds (about 0.1 dex)
+constexpr double LOSS_SIGMA_DEX = 0.1;
+
+// the losses of string i at an age between new (0) and played (1): each loss moves geometrically from one state
+// to the other, a GRM relation per loss between the two measured states
+inline grm::Result string_losses_network(int i, double age) {
+    age = std::min(std::max(age, 0.0), 1.0);
+    grm::Network net;
+    const char* names[3] = {"etaF", "etaA", "etaB"};
+    const double fresh[3] = {LOSSES_NEW[i].etaF, LOSSES_NEW[i].etaA, LOSSES_NEW[i].etaB};
+    const double played[3] = {LOSSES_PLAYED[i].etaF, LOSSES_PLAYED[i].etaA, LOSSES_PLAYED[i].etaB};
+    std::map<std::string, grm::Measurement> m;
+    for (int k = 0; k < 3; ++k) {
+        const std::string n = names[k], a = n + "_new", b = n + "_played";
+        net.add_node(n, fresh[k]);
+        net.add_node(a, fresh[k]);
+        net.add_node(b, played[k]);
+        net.add_log("age of " + n, {{n, 1}, {a, -(1.0 - age)}, {b, -age}}, 0.0, 1e-9);
+        m[a] = {fresh[k], LOSS_SIGMA_DEX};
+        m[b] = {played[k], LOSS_SIGMA_DEX};
+    }
+    return net.solve(m);
+}
+
 // ---------------------------------------------------------------- the attack: pick or finger meets the string
 inline grm::Result pluck_network(double mu, double L, double T, int fret, double p, double force, bool pick,
                                  double pick_mm) {

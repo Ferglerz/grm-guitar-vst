@@ -1,0 +1,70 @@
+// The editor drawn to a PNG (no host, no window): to look at the layout.
+// Usage: editor_snapshot out.png
+#include <chrono>
+#include <thread>
+#include <juce_audio_processors/juce_audio_processors.h>
+#include "../plugin/PluginProcessor.h"
+#include "../plugin/PluginEditor.h"
+
+int main(int argc, char** argv) {
+    juce::ScopedJuceInitialiser_GUI init;
+    std::unique_ptr<juce::AudioProcessor> plugin(createPluginFilter());
+    plugin->setPlayConfigDetails(0, 2, 48000.0, 512);
+    plugin->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> buf(2, 512);
+    juce::MidiBuffer midi;
+    for (int k = 0; k < 300; ++k) {
+        plugin->processBlock(buf, midi);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    auto* g = dynamic_cast<GRMGuitarProcessor*>(plugin.get());
+    g->addPattern(true);
+    auto song = g->getSong();
+    song.loop_start = 4.0;          // a loop over bars 2 to 3, a note written past the end
+    song.loop_end = 12.0;
+    grmg::RollNote far;
+    far.start = 33.0;
+    far.fret = 5;
+    song.notes.push_back(far);
+    song.fit_content();
+    g->setSong(song);
+    // a second guitar with a melody: the first one's notes show faint behind it
+    g->addGuitar();
+    grmg::Song lead;
+    lead.bars = 4;
+    const int frets[8] = {3, 5, 7, 8, 7, 5, 3, 2};
+    for (int k = 0; k < 8; ++k) {
+        grmg::RollNote n;
+        n.string = 3;
+        n.fret = frets[k];
+        n.start = 2.0 * k;
+        n.length = 1.5;
+        lead.notes.push_back(n);
+    }
+    g->setSong(lead);
+    g->params.getParameter("midi_mode")->setValueNotifyingHost(1.0f);
+    std::unique_ptr<juce::AudioProcessorEditor> editor(plugin->createEditorIfNeeded());
+    editor->setSize(1280, 820);
+    // let the editor's timers fill the views (the message loop, a few times)
+    for (int k = 0; k < 20; ++k) {
+        juce::Thread::sleep(20);
+    }
+    auto img = editor->createComponentSnapshot(editor->getLocalBounds(), true, 1.0f);
+    juce::File f(argc > 1 ? argv[1] : "editor.png");
+    f.deleteFile();
+    juce::FileOutputStream out(f);
+    juce::PNGImageFormat().writeImageToStream(img, out);
+    {   // the mixer on its own
+        MixerView mixer(*g);
+        mixer.setSize(420, 230);
+        auto m = mixer.createComponentSnapshot(mixer.getLocalBounds(), true, 1.0f);
+        juce::File mf(f.getSiblingFile(f.getFileNameWithoutExtension() + "_mixer.png"));
+        mf.deleteFile();
+        juce::FileOutputStream mo(mf);
+        juce::PNGImageFormat().writeImageToStream(m, mo);
+    }
+    plugin->editorBeingDeleted(editor.get());
+    editor.reset();
+    plugin->releaseResources();
+    return 0;
+}
