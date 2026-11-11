@@ -1,3 +1,118 @@
+# GRM Guitar 0.3.0
+
+![GRM Guitar 0.3.0: two guitars, the second one with the first one's notes faint behind it](docs/screenshot.png)
+
+The biggest release so far. The sound now follows measured guitars, the notes ring as long as the hands let them,
+up to eight guitars live in one plugin, and the roll writes chords, patterns and harmonies.
+
+The engine is the one of [grm-core](https://github.com/innermost47/grm-core), also available as a Python package:
+[pygrm](https://pypi.org/project/pygrm/) (`pip install pygrm`).
+
+## Sound
+
+- **Strings lose their energy as measured strings do** (Woodhouse 2012): inside the string, in the air, in the
+  bending steel, as a GRM network per string. The low partials ring longest and the high ones go first. The old
+  hand-made curve, and its "Resonance (s)" setting, are gone.
+- **String age**: from new strings to played ones (played strings lose their highs sooner).
+- **A body that no longer sounds like a banjo.** The top now carries its braces and bridge (about 200 g), and its
+  modes have the measured Q (about 50). The fundamentals that died in about 1 s now ring 2.5 to 3 times longer.
+  New sliders: **Braces (g)** and **Body resonance (Q)**.
+- **Wood**: 8 species with their density and stiffness (Wood Handbook), plus **Wood density** around the
+  species' average.
+- **Body: solid (0) to hollow (1)**: from a flat-top acoustic to a solid body.
+- **Sensor** (new tab):
+  - **microphone**: body and room, as before;
+  - **magnetic pickup**: the string's velocity at the pickup, through the coil, cable and pot as a GRM network.
+    Two measured pickups (a 1970s single coil, a hotter one), with sliders for the position and the cable;
+  - **piezo** under the saddle.
+- **Palm mute that acts progressively.** Its pressure no longer flips from nothing to everything near 0.05: the
+  strings it lands on get the palm network's own damping, and the pressure steps are three times finer.
+- **Looseness**: how far the player strays from the grid.
+
+## The notes ring as long as the hands let them
+
+- **Ringing by default.** An open string rings until it is played again. A fretted note rings until its string is
+  played again or until the left hand needs that finger elsewhere. This holds for strums, in loops and at the loop
+  point. The roll draws it as a fading trail.
+- **Endings per note** (right click): let it ring, stop at its end, or mute with the hand (which stops the
+  strings beside it too).
+- **Hand stops**: Alt+click anywhere on the grid, on a step or between two, stops every string there.
+- **When another pattern takes over**, the notes of the one before end as they were written.
+- **Chords at the very start** of a song keep their pick sweep (they used to land all at once).
+
+## Writing
+
+- **Every chord**: 12 roots with their sharp and flat names, 16 kinds, power chords included. The left-hand
+  network chooses each shape for the guitar's tuning; all 192 chords are checked playable on all 6 tunings.
+- **Fill strums / arpeggio** work over the selection, at any length, and keep the chords already written (the
+  pattern only adds the rhythm).
+- **Notes over several strings**: drag a note's top or bottom edge, then give each note its own fret. Useful for
+  barres and chord shapes on the grid.
+- **Dead notes** (X), resizing from the left, transposing (+/−).
+- **Harmonize** in the pattern's new **key and scale** (10 scales): the new note goes where the hand can play it.
+- **Greyed places**: where the hand cannot reach with the fret being written.
+- **Strumming and picking a note at the same moment** is refused (one hand).
+- **Hear the note just written** (Playback tab, on by default).
+- **Writing past the end** no longer changes the length or the loop. **Loop flags** in the ruler; pulling the end
+  flag past the end lengthens the song.
+- **Follow playhead** can be turned off.
+
+## Patterns
+
+- **Up to 24 patterns per guitar.**
+- **MIDI keys**:
+  - **Play notes**, as before;
+  - **Play patterns**: C1 plays pattern 1, C#1 pattern 2… Each pattern plays its loop while its key is held, on
+    every guitar that has it (a scene), or per guitar with "MIDI to guitars: Channel = guitar".
+- **The host's Stop** stops the patterns held by keys.
+
+## Several guitars
+
+- **Up to 8 guitars in one plugin**, each with its own settings (all automatable), patterns and player.
+- **Mixer**: gain, level, pan, mute, solo. Each guitar goes to the main output or to its own (enable
+  "Guitar 1" to "Guitar 8" in the host, then put each guitar's effects in the host).
+- **The other guitars appear faint behind the roll**, with their note names and their chords where they change. A
+  shorter pattern repeats under a longer one, where it really plays.
+- **Copy to guitar** (right click) and **Copy / Paste** of whole patterns.
+- **The header** shows the position in the pattern and in the whole song.
+- **Export WAV** mixes every guitar.
+
+## Performance
+
+- **Guitars in the same room share one room** (the heaviest part of the sound).
+- **Lighter real-time loops.** Four guitars went from about 23 % to about 14 % of each audio block on the build
+  machine.
+- **The plugin no longer lets a host put it to sleep** when it gets no input.
+- **A value that is not a number** can no longer silence a guitar for good.
+
+## Compatibility
+
+- **Sessions of 0.2.0 open as they were** (guitar 1 keeps every parameter id).
+- **The plugin's codes are unchanged**, so hosts find it in existing projects. The vendor name is now
+  **InnerMost47**.
+- **The Python app of grm-core was the proof of concept;** this plugin is the product. It is no longer kept in step
+  with it: one string's sound is still checked against the proof of concept's old loss curve, while the plugin now
+  uses the measured losses.
+
+## Tests
+
+- **`test_core`**: 210 checks.
+- **`test_physics`**: 153 checks.
+- **`test_play`**: 52 checks.
+- **`plugin_host_test`**: 18 checks.
+- **New tools:** `plugin_cpu_test` and `editor_snapshot`.
+
+## Known limits
+
+- **The body has seven modes below about 1.4 kHz**: moving its settings changes the "vowel" more than a real
+  guitar would.
+- **Some chord shapes chosen by the hand are unusual** (still playable).
+- **The magnetic pickup listens at one point.**
+- **The low E fundamental on a solid body may ring shorter** than measured on electric guitars.
+- **Slides, hammer-ons, pull-offs and bends** come next.
+
+---
+
 # GRM Guitar 0.2.0
 
 ![GRM Guitar, standalone, with the demo roll](docs/screenshot.png)

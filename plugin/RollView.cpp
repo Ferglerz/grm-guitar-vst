@@ -68,10 +68,14 @@ juce::Rectangle<float> RollView::strumRect(const RollStrum& s) const {
 
 RollView::Selection RollView::hitTest(juce::Point<float> p, bool& nearRightEdge) const {
     nearRightEdge = false;
+    hitLeftEdge = false;
+    hitStackEdge = 0;
     for (int k = (int) song.notes.size() - 1; k >= 0; --k) {
         const auto r = noteRect(song.notes[(size_t) k]);
         if (r.contains(p)) {
             nearRightEdge = p.x > r.getRight() - 7.0f;
+            hitLeftEdge = !nearRightEdge && r.getWidth() > 18.0f && p.x < r.getX() + 6.0f;
+            hitStackEdge = !nearRightEdge && !hitLeftEdge ? (p.y < r.getY() + 4.0f ? 1 : p.y > r.getBottom() - 4.0f ? -1 : 0) : 0;
             return {false, k};
         }
     }
@@ -79,6 +83,7 @@ RollView::Selection RollView::hitTest(juce::Point<float> p, bool& nearRightEdge)
         const auto r = strumRect(song.strums[(size_t) k]);
         if (r.contains(p)) {
             nearRightEdge = p.x > r.getRight() - 7.0f;
+            hitLeftEdge = !nearRightEdge && r.getWidth() > 18.0f && p.x < r.getX() + 6.0f;
             return {true, k};
         }
     }
@@ -201,51 +206,124 @@ void RollView::paint(juce::Graphics& g) {
             }
         }
     }
+    // the hand stops: a hand flat on every string
+    for (double t : song.stops) {
+        const float x = beatToX(t);
+        if (x < GUTTER || x > right) continue;
+        const float top = (float) RULER, bottom = laneTop(6);
+        g.setColour(TEXT.withAlpha(0.85f));
+        for (float y = top; y < bottom; y += 6.0f) g.fillRect(x - 1.0f, y, 2.0f, 3.0f);
+        g.fillRoundedRectangle(x - 7.0f, top + 1.0f, 14.0f, 5.0f, 2.0f);    // the hand, flat
+    }
     // where the hands cannot reach with the brush's fret
     refreshBlocked();
     g.setColour(juce::Colours::black.withAlpha(0.42f));
     for (const auto& r : blocked) g.fillRect(r);
     refreshGhosts();
     // the other guitars, faint, with the name of each note (they may be tuned otherwise: the pitch is what matters)
-    for (const auto& gh : ghosts) {
-        const auto c = GUITAR_COLOURS[gh.guitar % 8];
-        const auto& tuning = TUNINGS[juce::jlimit(0, NUM_TUNINGS - 1, gh.tuning)];
-        for (const auto& n : gh.song.notes) {
-            const auto r = noteRect(n).reduced(0.0f, laneHeight() * 0.18f);
-            if (r.getRight() < GUTTER || r.getX() > right) continue;
-            g.setColour(c.withAlpha(0.13f));
-            g.fillRoundedRectangle(r, 3.0f);
-            g.setColour(c.withAlpha(0.4f));
-            g.drawRoundedRectangle(r, 3.0f, 1.0f);
-            if (r.getWidth() > 22) {
-                g.setFont(font(10.0f));
-                g.drawText(juce::MidiMessage::getMidiNoteName(tuning.midi[n.string] + n.fret, true, true, 3),
-                           r.reduced(3.0f, 0.0f).toNearestInt(), juce::Justification::centredRight);
+    // The other guitars, faint, with the name of each note (they may be tuned otherwise: the pitch is what matters).
+    // In a loop each guitar repeats its own loop, whatever its length: a 4-bar guitar is drawn twice under an 8-bar
+    // one, where it really plays (at beat t it plays its beat a + (t - a) mod its length).
+    {
+        const double visible = (getWidth() - GUTTER) / ppb;
+        const double from = std::max(0.0, viewBeat) - 1.0, to = viewBeat + visible + 1.0;
+        for (const auto& gh : ghosts) {
+            const auto c = GUITAR_COLOURS[gh.guitar % 8];
+            const auto& tuning = TUNINGS[juce::jlimit(0, NUM_TUNINGS - 1, gh.tuning)];
+            double a = 0.0, b = gh.song.length_beats();
+            if (looping) std::tie(a, b) = gh.song.loop_range();
+            const double len = b - a;
+            if (len <= 1e-9) continue;
+            // the repeats that reach the view (once only when the roll does not loop)
+            int k0 = 0, k1 = 0;
+            if (looping) {
+                k0 = (int) std::floor((from - b) / len);
+                k1 = (int) std::ceil((to - a) / len);
+                k0 = std::max(k0, (int) std::floor(-a / len));
             }
-        }
-        for (const auto& t : gh.song.strums) {
-            const auto r = strumRect(t).reduced(0.0f, 6.0f);
-            if (r.getRight() < GUTTER || r.getX() > right) continue;
-            g.setColour(c.withAlpha(0.12f));
-            g.fillRoundedRectangle(r, 3.0f);
-            g.setColour(c.withAlpha(0.35f));
-            g.drawRoundedRectangle(r, 3.0f, 1.0f);
+            for (int k = k0; k <= k1; ++k) {
+                const double shift = k * len;
+                for (auto n : gh.song.notes) {
+                    if (looping && (n.start < a - 1e-9 || n.start >= b - 1e-9)) continue;   // not in its loop: not played
+                    n.start += shift;
+                    if (n.start < -1e-9) continue;
+                    const auto r = noteRect(n).reduced(0.0f, laneHeight() * 0.18f);
+                    if (r.getRight() < GUTTER || r.getX() > right) continue;
+                    g.setColour(c.withAlpha(0.13f));
+                    g.fillRoundedRectangle(r, 3.0f);
+                    g.setColour(c.withAlpha(0.4f));
+                    g.drawRoundedRectangle(r, 3.0f, 1.0f);
+                    if (r.getWidth() > 22) {
+                        g.setFont(font(10.0f));
+                        g.drawText(n.dead ? juce::String("x") : juce::MidiMessage::getMidiNoteName(tuning.midi[n.string] + n.fret, true, true, 3),
+                                   r.reduced(3.0f, 0.0f).toNearestInt(), juce::Justification::centredRight);
+                    }
+                }
+                std::string lastChord;
+                for (auto t : gh.song.strums) {
+                    if (looping && (t.start < a - 1e-9 || t.start >= b - 1e-9)) continue;
+                    t.start += shift;
+                    const bool changes = t.chord != lastChord;
+                    lastChord = t.chord;
+                    if (t.start < -1e-9) continue;
+                    const auto r = strumRect(t).reduced(0.0f, 6.0f);
+                    if (r.getRight() < GUTTER || r.getX() > right) continue;
+                    g.setColour(c.withAlpha(0.12f));
+                    g.fillRoundedRectangle(r, 3.0f);
+                    g.setColour(c.withAlpha(0.35f));
+                    g.drawRoundedRectangle(r, 3.0f, 1.0f);
+                    if (changes && !t.chord.empty()) {         // the other guitar's chord, where it changes
+                        g.setColour(c.withAlpha(0.75f));
+                        g.setFont(font(10.0f));
+                        g.drawText(juce::String(t.chord), juce::Rectangle<float>(r.getX() + 2.0f, r.getBottom() - 1.0f, 60.0f, 11.0f).toNearestInt(),
+                                   juce::Justification::centredLeft, false);
+                    }
+                }
+                // where the other guitar's loop starts again: a faint mark of its colour in the ruler
+                const float xr = beatToX(a + shift);
+                if (looping && k > k0 && xr > GUTTER && xr < right) {
+                    g.setColour(c.withAlpha(0.6f));
+                    g.fillRect(xr - 1.0f, (float) RULER - 4.0f, 2.0f, 4.0f);
+                }
+            }
         }
     }
     // notes
+    {   // how long the notes ring: computed again only when the song changes
+        const std::string key = song.to_text() + (looping ? "L" : "-");
+        if (key != ringKey) {
+            ringKey = key;
+            ringCache = grmg::ringing(song, song.length_beats(), looping);
+        }
+    }
+    const auto& rings = ringCache;
     for (size_t k = 0; k < song.notes.size(); ++k) {
         const auto& n = song.notes[k];
         const auto r = noteRect(n);
         if (r.getRight() < GUTTER || r.getX() > right) continue;
         const auto c = STRING_COLOURS[n.string];
         const bool selected = n.selected;
-        // the note rings until its end, or until its string is played again
+        // the note itself, then what it rings after it (as long as the hands let it: ringing.hpp), fading
         const float cut = beatToX(std::min(n.start + n.length, nextPluck(n.string, n.start)));
         auto ringing = r.withRight(std::max(r.getX() + 6.0f, cut));
+        if (k < rings.note_end.size() && n.end == RollNote::ring) {
+            const float tail = std::min((float) right, beatToX(std::min(rings.note_end[k], nextPluck(n.string, n.start))));
+            if (tail > ringing.getRight() + 1.0f) {
+                juce::ColourGradient fade(c.withAlpha(0.32f), ringing.getRight(), 0.0f, c.withAlpha(0.04f), tail, 0.0f, false);
+                g.setGradientFill(fade);
+                g.fillRect(juce::Rectangle<float>(ringing.getRight() - 3.0f, r.getY() + r.getHeight() * 0.3f,
+                                                  tail - ringing.getRight() + 3.0f, r.getHeight() * 0.4f));
+            }
+        }
         g.setColour(c.withAlpha(0.25f));
         g.fillRoundedRectangle(r, 4.0f);
         g.setColour(c.withAlpha(0.45f + 0.5f * (float) n.velocity));
         g.fillRoundedRectangle(ringing, 4.0f);
+        if (n.end != RollNote::ring) {            // how it stops: a bar (finger lifts) or a flat hand (wider)
+            g.setColour(TEXT.withAlpha(0.8f));
+            const float w = n.end == RollNote::hand ? 3.0f : 1.5f;
+            g.fillRect(ringing.getRight() - w, r.getY() + 2.0f, w, r.getHeight() - 4.0f);
+        }
         if (n.palm) {
             g.setColour(juce::Colours::black.withAlpha(0.35f));
             for (float x = r.getX() - r.getHeight(); x < ringing.getRight(); x += 6.0f)
@@ -257,7 +335,8 @@ void RollView::paint(juce::Graphics& g) {
         g.drawRoundedRectangle(r, 4.0f, selected ? 2.0f : 1.0f);
         g.setColour(juce::Colours::black);
         g.setFont(font(juce::jlimit(10.0f, 15.0f, r.getHeight() * 0.6f), true));
-        g.drawText(juce::String(n.fret) + (n.palm ? " PM" : ""), r.reduced(4, 0).toNearestInt(), juce::Justification::centredLeft, true);
+        g.drawText((n.dead ? juce::String("x") : juce::String(n.fret)) + (n.palm ? " PM" : ""), r.reduced(4, 0).toNearestInt(),
+                   juce::Justification::centredLeft, true);
     }
     // gutter: the strings
     g.setColour(PANEL);
@@ -442,6 +521,109 @@ void RollView::refreshBlocked() {
         }
 }
 
+// ------------------------------------------------------------------ hand stops
+double RollView::stopBeat(float x) const {
+    const double half = snap / 2.0;
+    return std::max(0.0, std::round(xToBeat(x) / half) * half);
+}
+
+void RollView::toggleStop(double beat) {
+    edit([&](Song& s) {
+        const double tolerance = 4.0 / ppb;
+        auto it = std::find_if(s.stops.begin(), s.stops.end(), [&](double t) { return std::abs(t - beat) < tolerance; });
+        if (it != s.stops.end()) s.stops.erase(it);
+        else s.stops.push_back(beat);
+    }, false);
+}
+
+// ------------------------------------------------------------------ chords, transposing, harmonizing
+int RollView::tuning() const { return (int) std::lround(processor.current().param("tuning")); }
+
+grmg::Chord RollView::currentChord() const { return grmg::chord_for(chordRoot, chordQuality, tuning()); }
+
+bool RollView::selectionRange(double& from, double& to) const {
+    from = 1e300;
+    to = -1e300;
+    for (const auto& n : song.notes)
+        if (n.selected) {
+            from = std::min(from, n.start);
+            to = std::max(to, n.start + n.length);
+        }
+    for (const auto& t : song.strums)
+        if (t.selected) {
+            from = std::min(from, t.start);
+            to = std::max(to, t.start + t.length);
+        }
+    return to > from;
+}
+
+void RollView::transposeSelected(int semitones) {
+    const int tun = tuning();
+    changeSelected([semitones](RollNote& n) { n.fret = juce::jlimit(0, NUM_FRETS_UI - 1, n.fret + semitones); },
+                   [semitones, tun](RollStrum& t) {
+                       const auto rq = grmg::parse_chord(t.chord);
+                       if (rq.first >= 0) {                       // a named chord: the same chord, a semitone away
+                           const auto c = grmg::chord_for(rq.first + semitones, rq.second, tun);
+                           t.frets = c.frets;
+                           t.chord = c.name;
+                       } else {                                  // a shape of its own: every fret moves
+                           for (auto& f : t.frets)
+                               if (f >= 0) f = juce::jlimit(0, NUM_FRETS_UI - 1, f + semitones);
+                       }
+                   });
+}
+
+void RollView::harmonizeSelected(int degrees) {
+    const auto& open = TUNINGS[juce::jlimit(0, NUM_TUNINGS - 1, tuning())].midi;
+    const bool pick = processor.readSettings().pick;
+    edit([&](Song& s) {
+        std::vector<RollNote> added;
+        for (const auto& n : s.notes) {
+            if (!n.selected || n.dead) continue;
+            const int target = grmg::scale_step(open[n.string] + n.fret, s.key, s.scale, degrees);
+            // the place on the neck for it: a string where the hand can play it with what sounds there, nearest
+            // to the note it harmonizes
+            RollNote best;
+            double bestCost = 1e300;
+            for (int i = 0; i < 6; ++i) {
+                const int f = target - open[i];
+                if (f < 0 || f >= NUM_FRETS_UI || i == n.string) continue;
+                RollNote c = n;
+                c.string = i;
+                c.fret = f;
+                c.selected = false;
+                Song with = s;
+                for (const auto& a : added) with.notes.push_back(a);
+                bool taken = false;          // the string is busy then
+                for (const auto& o : with.notes)
+                    taken |= o.string == i && o.start < c.start + c.length - 1e-9 && c.start < o.start + o.length - 1e-9;
+                if (taken || !grmg::playable_with(with, c, pick)) continue;
+                const double cost = std::abs(f - n.fret) + 0.3 * std::abs(i - n.string);
+                if (cost < bestCost) {
+                    bestCost = cost;
+                    best = c;
+                }
+            }
+            if (bestCost < 1e299) added.push_back(best);
+        }
+        for (auto& a : added) {
+            a.selected = true;
+            s.notes.push_back(a);
+        }
+    });
+}
+
+void RollView::copySelectedToGuitar(int target) {
+    Song items;
+    for (const auto& n : song.notes)
+        if (n.selected) items.notes.push_back(n);
+    for (const auto& t : song.strums)
+        if (t.selected) items.strums.push_back(t);
+    if (items.notes.empty() && items.strums.empty()) return;
+    for (int g = 0; g < processor.getGuitarCount(); ++g)
+        if (g != processor.getSelectedGuitar() && (target < 0 || g == target)) processor.addToGuitar(g, items);
+}
+
 double RollView::playhead() const {
     const int playing = processor.getPlayingPattern();
     return playing == processor.getEditingPattern() ? processor.getShownBeat() : -1.0;
@@ -461,7 +643,7 @@ void RollView::findProblems() {
 
 void RollView::commit(bool checkPlayable, bool fit) {
     song.sort();
-    if (fit) song.fit_content();
+    (void) fit;     // writing past the end does not change the song's length: the end flag does
     const auto before = problems;
     findProblems();
     if (checkPlayable && problems.size() > before.size() && !undoStack.empty()) {
@@ -677,9 +859,11 @@ void RollView::showEmptyMenu() {
     juce::PopupMenu menu;
     menu.addItem(10, "Paste (Ctrl+V)", juce::SystemClipboard::getTextFromClipboard().startsWith("grm-guitar-roll"));
     menu.addItem(11, "Select all (Ctrl+A)");
+    menu.addItem(12, "Hand stop here: stop every string (Alt+click)");
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this).withMousePosition(), [this](int id) {
         if (id == 10) paste(pasteBeat);
         else if (id == 11) selectAll();
+        else if (id == 12) toggleStop(stopAt);
     });
 }
 
@@ -696,6 +880,12 @@ void RollView::showMenu(const Selection& s) {
         for (int f = 0; f < NUM_FRETS_UI; ++f) frets.addItem(100 + f, juce::String(f), true, n.fret == f);
         menu.addSubMenu("Fret", frets);
         menu.addItem(2, "Palm mute (P)", true, n.palm);
+        menu.addItem(10, "Dead note (X)", true, n.dead);
+        juce::PopupMenu ends;
+        ends.addItem(400, "Let it ring (as long as the hands allow)", true, n.end == RollNote::ring);
+        ends.addItem(401, "Stop at its end (the finger lifts)", true, n.end == RollNote::stop);
+        ends.addItem(402, "Mute with the hand (and the strings beside)", true, n.end == RollNote::hand);
+        menu.addSubMenu("Ending", ends);
         for (int k = 0; k < 5; ++k) vel.addItem(200 + k, dyn[k], true, std::abs(n.velocity - velocities[k]) < 0.01);
     } else {
         const auto& t = song.strums[(size_t) s.index];
@@ -703,11 +893,34 @@ void RollView::showMenu(const Selection& s) {
         menu.addItem(4, juce::String::fromUTF8("Up \xe2\x86\x91"), true, t.up);
         menu.addItem(2, "Palm mute (P)", true, t.palm);
         juce::PopupMenu chords;
-        for (int c = 0; c < NUM_CHORDS; ++c) chords.addItem(300 + c, CHORD_SHAPES[c].name, true, t.chord == CHORD_SHAPES[c].name);
+        const auto now = grmg::parse_chord(t.chord);
+        for (int r = 0; r < 12; ++r) {
+            juce::PopupMenu kinds;
+            for (int q = 0; q < (int) grmg::chord_qualities().size(); ++q)
+                kinds.addItem(1000 + r * 32 + q, grmg::chord_name(r, q), true, now.first == r && now.second == q);
+            chords.addSubMenu(grmg::ROOT_LABELS[r], kinds, true, nullptr, now.first == r);
+        }
         menu.addSubMenu("Chord", chords);
         for (int k = 0; k < 5; ++k) vel.addItem(200 + k, dyn[k], true, std::abs(t.velocity - velocities[k]) < 0.01);
     }
     menu.addSubMenu("Dynamics", vel);
+    menu.addItem(4001, "Transpose up (+)");
+    menu.addItem(4002, "Transpose down (-)");
+    {
+        juce::PopupMenu harm;
+        const char* names[] = {"a third above", "a fourth above", "a fifth above", "a sixth above", "an octave above",
+                               "a third below", "a sixth below"};
+        const int degrees[] = {2, 3, 4, 5, 7, -2, -5};
+        for (int k = 0; k < 7; ++k) harm.addItem(3000 + 50 + degrees[k], names[k]);
+        menu.addSubMenu("Harmonize (in " + juce::String(grmg::ROOT_NAMES[song.key]) + " " + grmg::scales()[(size_t) song.scale].name + ")",
+                        harm, !s.strum);
+        juce::PopupMenu to;
+        for (int g = 0; g < processor.getGuitarCount(); ++g)
+            if (g != processor.getSelectedGuitar()) to.addItem(2000 + g, processor.getGuitarName(g));
+        to.addSeparator();
+        to.addItem(2099, "All the other guitars");
+        menu.addSubMenu("Copy to guitar", to, processor.getGuitarCount() > 1);
+    }
     menu.addSeparator();
     menu.addItem(5, "Copy (Ctrl+C)");
     menu.addItem(6, "Cut (Ctrl+X)");
@@ -730,11 +943,18 @@ void RollView::showMenu(const Selection& s) {
                            else if (id == 9) selectAll();
                            else if (id == 2) changeSelected([](RollNote& n) { n.palm = !n.palm; }, [](RollStrum& t) { t.palm = !t.palm; });
                            else if (id == 3 || id == 4) changeSelected(nullptr, [id](RollStrum& t) { t.up = id == 4; });
-                           else if (id >= 300) changeSelected(nullptr, [id](RollStrum& t) {
-                               const auto& c = CHORD_SHAPES[id - 300];
-                               for (int i = 0; i < 6; ++i) t.frets[(size_t) i] = c.frets[i];
-                               t.chord = c.name;
-                           });
+                           else if (id == 10) changeSelected([](RollNote& n) { n.dead = !n.dead; }, nullptr);
+                           else if (id == 4001 || id == 4002) transposeSelected(id == 4001 ? 1 : -1);
+                           else if (id >= 3000 && id < 3100) harmonizeSelected(id - 3050);
+                           else if (id >= 2000 && id < 2100) copySelectedToGuitar(id == 2099 ? -1 : id - 2000);
+                           else if (id >= 1000 && id < 2000) {
+                               const auto c = grmg::chord_for((id - 1000) / 32, (id - 1000) % 32, tuning());
+                               changeSelected(nullptr, [c](RollStrum& t) {
+                                   t.frets = c.frets;
+                                   t.chord = c.name;
+                               });
+                           }
+                           else if (id >= 400 && id <= 402) changeSelected([id](RollNote& n) { n.end = id - 400; }, nullptr);
                            else if (id >= 200) changeSelected([&](RollNote& n) { n.velocity = velocities[id - 200]; },
                                                               [&](RollStrum& t) { t.velocity = velocities[id - 200]; });
                            else if (id >= 100) changeSelected([id](RollNote& n) { n.fret = id - 100; }, nullptr);
@@ -769,9 +989,14 @@ void RollView::mouseDown(const juce::MouseEvent& e) {
         if (onChanged) onChanged();
         return;
     }
+    if (e.mods.isAltDown() && !e.mods.isPopupMenu()) {      // Alt+click: a hand stop (or remove the one there)
+        toggleStop(stopBeat(p.x));
+        return;
+    }
     bool edge = false;
     const auto hit = hitTest(p, edge);
     pasteBeat = juce::jlimit(0.0, song.max_beats() - snap, snapDown(std::max(0.0, xToBeat(p.x))));
+    stopAt = stopBeat(p.x);
     if (e.mods.isPopupMenu()) {
         if (hit.index >= 0) showMenu(hit);
         else showEmptyMenu();
@@ -794,7 +1019,8 @@ void RollView::mouseDown(const juce::MouseEvent& e) {
             selectOnly(hit);
         }
         sel = hit;
-        drag = edge && !ctrl ? Drag::resize : Drag::move;
+        drag = edge && !ctrl ? Drag::resize : hitLeftEdge && !ctrl ? Drag::resizeLeft
+             : hitStackEdge != 0 && !ctrl && !hit.strum ? Drag::stack : Drag::move;
         dragBase = song;
         if (!hit.strum) brushFret[song.notes[(size_t) hit.index].string] = song.notes[(size_t) hit.index].fret;
         repaint();
@@ -819,8 +1045,8 @@ void RollView::mouseDown(const juce::MouseEvent& e) {
         RollStrum s;
         s.start = start;
         s.length = newLength;
-        const auto& c = CHORD_SHAPES[chord];
-        for (int i = 0; i < 6; ++i) s.frets[(size_t) i] = c.frets[i];
+        const auto c = currentChord();
+        s.frets = c.frets;
         s.chord = c.name;
         s.selected = true;
         song.strums.push_back(s);
@@ -831,6 +1057,8 @@ void RollView::mouseDown(const juce::MouseEvent& e) {
         n.fret = brushFret[n.string];
         n.start = start;
         n.length = fittedLength(n.string, start);    // no longer than the room before the string's next note
+        if (processor.params.getRawParameterValue("audition")->load() > 0.5f)   // hear the note just written
+            processor.pluckFromInterface(n.string, n.fret, (float) n.velocity);
         n.selected = true;
         song.notes.push_back(n);
         sel = {false, (int) song.notes.size() - 1};
@@ -855,9 +1083,36 @@ void RollView::mouseDrag(const juce::MouseEvent& e) {
         return;
     }
     if (drag == Drag::loopStart || drag == Drag::loopEnd) {
-        const double b = juce::jlimit(0.0, song.length_beats(), snapBeat(xToBeat(e.position.x)));
+        const double b = juce::jlimit(0.0, drag == Drag::loopEnd ? song.max_beats() : song.length_beats(), snapBeat(xToBeat(e.position.x)));
         if (drag == Drag::loopStart) song.loop_start = std::min(b, song.loop_end - snap);
-        else song.loop_end = std::max(b, song.loop_start + snap);
+        else {
+            song.loop_end = std::max(b, song.loop_start + snap);
+            // pulled past the end: the song grows to hold it (never shrinks from here)
+            const int need = (int) std::ceil(song.loop_end / song.beats_per_bar - 1e-9);
+            if (need > song.bars) song.bars = std::min(grmg::Song::MAX_BARS, need);
+        }
+        dragChanged = true;
+        repaint();
+        return;
+    }
+    if (drag == Drag::stack && sel.index >= 0 && !sel.strum) {
+        // a note drawn over more strings (a barre, or a chord shape): the same note on every string up to the mouse,
+        // each fret to change afterwards (digits, wheel)
+        const auto base = dragBase.notes[(size_t) sel.index];
+        const int row = juce::jlimit(0, 5, rowAt(e.position.y));
+        const int to = stringOfRow(row);
+        song = dragBase;
+        const int lo = std::min(base.string, to), hi = std::max(base.string, to);
+        for (int i = lo; i <= hi; ++i) {
+            if (i == base.string) continue;
+            bool busy = false;
+            for (const auto& n : song.notes) busy |= n.string == i && std::abs(n.start - base.start) < 1e-9;
+            if (busy) continue;
+            auto c = base;
+            c.string = i;
+            c.selected = true;
+            song.notes.push_back(c);
+        }
         dragChanged = true;
         repaint();
         return;
@@ -917,6 +1172,21 @@ void RollView::mouseDrag(const juce::MouseEvent& e) {
             }
         for (auto& t : song.strums)
             if (t.selected) t.start += shift;
+    } else if (drag == Drag::resizeLeft) {
+        // the start moves, the end stays
+        const double d = snapBeat(b - downBeat);
+        for (auto& n : song.notes)
+            if (n.selected) {
+                const double end = n.start + n.length, start = juce::jlimit(0.0, end - snap, n.start + d);
+                n.start = start;
+                n.length = end - start;
+            }
+        for (auto& t : song.strums)
+            if (t.selected) {
+                const double end = t.start + t.length, start = juce::jlimit(0.0, end - snap, t.start + d);
+                t.start = start;
+                t.length = end - start;
+            }
     } else {
         const double d = snapBeat(b - downBeat);
         for (auto& n : song.notes)
@@ -978,6 +1248,18 @@ void RollView::mouseMove(const juce::MouseEvent& e) {
         setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
         return;
     }
+    {
+        bool right = false;
+        const auto h = hitTest(e.position, right);
+        if (h.index >= 0 && (hitLeftEdge || right)) {
+            setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
+            return;
+        }
+        if (h.index >= 0 && !h.strum && hitStackEdge != 0) {
+            setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
+            return;
+        }
+    }
     bool edge = false;
     const auto hit = hitTest(e.position, edge);
     setMouseCursor(hit.index >= 0 ? (edge ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::DraggingHandCursor)
@@ -1004,15 +1286,7 @@ void RollView::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelD
         // the wheel on a note changes its fret (of every selected note if it is one of them); on a strum, its chord
         if (!isSelected(hit)) selectOnly(hit);
         const int step = w.deltaY > 0 ? 1 : -1;
-        changeSelected([step](RollNote& n) { n.fret += step; },
-                       [step](RollStrum& t) {
-                           int c = 0;
-                           for (int k = 0; k < NUM_CHORDS; ++k)
-                               if (t.chord == CHORD_SHAPES[k].name) c = k;
-                           c = (c + step + NUM_CHORDS) % NUM_CHORDS;
-                           for (int i = 0; i < 6; ++i) t.frets[(size_t) i] = CHORD_SHAPES[c].frets[i];
-                           t.chord = CHORD_SHAPES[c].name;
-                       });
+        transposeSelected(step);
         return;
     }
     const float d = std::abs(w.deltaX) > std::abs(w.deltaY) ? w.deltaX : w.deltaY;
@@ -1095,6 +1369,14 @@ bool RollView::keyPressed(const juce::KeyPress& k) {
     const juce::juce_wchar ch = k.getTextCharacter();
     if (!ctrl && (ch == 'p' || ch == 'P')) {
         changeSelected([](RollNote& n) { n.palm = !n.palm; }, [](RollStrum& t) { t.palm = !t.palm; });
+        return true;
+    }
+    if (!ctrl && (ch == 'x' || ch == 'X')) {
+        changeSelected([](RollNote& n) { n.dead = !n.dead; }, nullptr);
+        return true;
+    }
+    if (!ctrl && (ch == '+' || ch == '-')) {
+        transposeSelected(ch == '+' ? 1 : -1);
         return true;
     }
     if (!ctrl && ch >= '0' && ch <= '9') {

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Anthony Charretier
 cmake_minimum_required(VERSION 3.22)
-project(GRMGuitar VERSION 0.2.0 LANGUAGES C CXX)
+project(GRMGuitar VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -82,6 +82,9 @@ if(GRMG_BUILD_PLUGIN)
         add_executable(plugin_host_test tests/plugin_host_test.cpp)
         target_link_libraries(plugin_host_test PRIVATE GRMGuitar juce::juce_audio_formats juce::juce_recommended_config_flags)
         target_compile_definitions(plugin_host_test PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+        add_executable(plugin_cpu_test tests/plugin_cpu_test.cpp)
+        target_link_libraries(plugin_cpu_test PRIVATE GRMGuitar juce::juce_audio_formats juce::juce_recommended_config_flags)
+        target_compile_definitions(plugin_cpu_test PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
         add_executable(editor_snapshot tests/editor_snapshot.cpp)
         target_link_libraries(editor_snapshot PRIVATE GRMGuitar juce::juce_audio_formats juce::juce_recommended_config_flags)
         target_compile_definitions(editor_snapshot PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)

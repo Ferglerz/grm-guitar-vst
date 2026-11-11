@@ -12,7 +12,9 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
+#include "../core/chords.hpp"
 #include "../core/playability.hpp"
+#include "../core/ringing.hpp"
 #include "../core/song.hpp"
 
 class GRMGuitarProcessor;
@@ -35,7 +37,14 @@ public:
     ~RollView() override;
 
     // the tools of the toolbar
-    int chord = 7;                 // G
+    int chordRoot = 7, chordQuality = 0;   // the chord of new strums and fills (G major)
+    grmg::Chord currentChord() const;      // its shape on this guitar's tuning (chords.hpp: the hand chooses it)
+    int tuning() const;
+    // the span of the selection (false: nothing selected)
+    bool selectionRange(double& from, double& to) const;
+    void transposeSelected(int semitones);        // notes a fret up or down, strums a semitone (their chord follows)
+    void harmonizeSelected(int degrees);          // a note `degrees` scale steps from each selected note, where the hand can
+    void copySelectedToGuitar(int guitar);        // -1: every other guitar
     double snap = 0.25;            // beats
     double newLength = 1.0;        // beats, length of a new note or strum
     int currentBar = 0;            // where Fill writes
@@ -85,10 +94,12 @@ private:
     std::vector<juce::Rectangle<float>> blocked;
     std::string blockedKey;
     void refreshBlocked();
-    double fittedLength(int string, double start) const;   // a new note: no longer than the room before the next one
+    double fittedLength(int string, double start) const;
+    grmg::Ringing ringCache;
+    std::string ringKey;   // a new note: no longer than the room before the next one
     int brushFret[6] = {0, 0, 0, 0, 0, 0};
 
-    enum class Drag { none, move, resize, rect, loopStart, loopEnd };
+    enum class Drag { none, move, resize, resizeLeft, stack, rect, loopStart, loopEnd };
     struct Selection { bool strum = false; int index = -1; } sel;
     Drag drag = Drag::none;
     bool dragChanged = false;
@@ -117,6 +128,11 @@ private:
     juce::Rectangle<float> noteRect(const grmg::RollNote& n) const;
     juce::Rectangle<float> strumRect(const grmg::RollStrum& s) const;
     Selection hitTest(juce::Point<float> p, bool& nearRightEdge) const;
+    mutable bool hitLeftEdge = false;   // the last hitTest was on an object's left edge
+    mutable int hitStackEdge = 0;       // ... on a note's top (+1) or bottom (-1) edge: drag it over more strings
+    void toggleStop(double beat);       // a hand stop there (or none if there was one)
+    double stopBeat(float x) const;     // the beat a hand stop goes to: on the grid's steps and between them
+    double stopAt = 0.0;                // where the last right click was (the menu's hand stop)
     double nextPluck(int string, double after) const;      // when the string is played again
     void showMenu(const Selection& s);
     void changeSelected(const std::function<void(grmg::RollNote&)>& note, const std::function<void(grmg::RollStrum&)>& strum);

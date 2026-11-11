@@ -95,8 +95,18 @@ public:
             sym_set_ = true;
         }
     }
-    void set_performance(const Performance* p) {
+    // carry: another pattern takes over (not a new take of the same one): the notes of the old one keep the endings
+    // the player asked for (a note asked to stop, a hand that stops strings) instead of ringing on
+    void set_performance(const Performance* p, bool carry = false) {
         if (p == perf_) return;
+        pending_count_ = 0;
+        if (carry && perf_ && expected_beat_ >= 0) {
+            for (const auto& e : perf_->events) {
+                if (e.type != EventType::damp || e.beat <= expected_beat_ || e.beat > expected_beat_ + CARRY_BEATS) continue;
+                if (!voices_[(size_t) e.string].active || pending_count_ >= (int) pending_.size()) continue;
+                pending_[(size_t) pending_count_++] = {e, e.beat - expected_beat_};
+            }
+        }
         // the finger noises sounding are samples of the old performance, which the worker frees soon after:
         // they stop here (a new take, an edit or a player setting while a squeak plays)
         for (auto& s : squeaks_) s.clear();
@@ -138,6 +148,13 @@ public:
     void all_off() {
         for (auto& v : voices_)
             if (v.active) v.damp();
+    }
+    // silence at once (after a value that is not a number): every string at rest, set up again by the next notes
+    void reset_strings() {
+        for (auto& v : voices_) v.active = false;
+        for (auto& v : fading_) v.active = false;
+        for (auto& s : sym_) s.on = false;
+        sym_set_ = false;
     }
     // a string struck by hand (MIDI, a click on the neck): attack network of the model (set force and place)
     void pluck_string(int i, int fret, double velocity) {
@@ -199,6 +216,11 @@ private:
     static constexpr double LIVE_PALM_DAMP = 60.0;   // s^-1: a palm laid on ringing strings
     size_t next_ = 0;
     double expected_beat_ = -1.0;
+    // endings of the pattern before, still to come (beats from now)
+    struct Pending { Event e; double beats; };
+    static constexpr double CARRY_BEATS = 16.0;
+    std::array<Pending, 64> pending_{};
+    int pending_count_ = 0;
 
     void set_palm(bool down) {
         if (down == palm_down_) return;
@@ -261,6 +283,18 @@ private:
     // `n` samples (n <= BLOCK): song events at their sample, strings, bridge
     void render_part(float* out, int n, const Transport& tr, int offset, float* pk) {
         int pos = 0;
+        // the endings carried from the pattern before (to the block: a few milliseconds)
+        if (pending_count_ > 0 && tr.playing) {
+            const double advance = n * tr.beats_per_sample;
+            int keep = 0;
+            for (int k = 0; k < pending_count_; ++k) {
+                auto& pd = pending_[(size_t) k];
+                pd.beats -= advance;
+                if (pd.beats <= 0) apply(pd.e);
+                else pending_[(size_t) keep++] = pd;
+            }
+            pending_count_ = keep;
+        }
         const bool song = tr.playing && perf_ && model_ && tr.beats_per_sample > 0;
         double beat = tr.beat + offset * tr.beats_per_sample;
         if (song) {

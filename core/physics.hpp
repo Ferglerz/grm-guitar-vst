@@ -684,11 +684,12 @@ struct Stroke { double t, A, v, force, p, d, palm_x, palm_N; };
 // a source of the player's imprecision: normal(mean, sd); `exact` gives the intents themselves
 struct PlayerNoise {
     bool exact = false;
+    double amount = 1.0;      // how loose the player is: 1 the default imprecision, 0 none, 2 twice as much
     std::mt19937 rng {1};
     double normal(double sd) {
-        if (exact) return 0.0;
+        if (exact || amount <= 0) return 0.0;
         std::normal_distribution<double> d(0.0, sd);
-        return d(rng);
+        return amount * d(rng);
     }
 };
 

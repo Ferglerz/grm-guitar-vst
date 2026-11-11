@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     far.start = 33.0;
     far.fret = 5;
     song.notes.push_back(far);
-    song.fit_content();
+    song.bars = 9;
     g->setSong(song);
     // a second guitar with a melody: the first one's notes show faint behind it
     g->addGuitar();
@@ -41,6 +41,22 @@ int main(int argc, char** argv) {
         n.length = 1.5;
         lead.notes.push_back(n);
     }
+    grmg::RollNote dead;
+    dead.string = 2;
+    dead.fret = 5;
+    dead.start = 2.0;
+    dead.length = 1.0;
+    dead.dead = true;
+    lead.notes.push_back(dead);
+    for (int i = 0; i < 3; ++i) {          // a shape over three strings, each its own fret
+        grmg::RollNote b;
+        b.string = i;
+        b.fret = i == 0 ? 0 : 2;
+        b.start = 12.0;
+        b.length = 2.0;
+        lead.notes.push_back(b);
+    }
+    lead.stops.push_back(9.0);
     g->setSong(lead);
     g->params.getParameter("midi_mode")->setValueNotifyingHost(1.0f);
     std::unique_ptr<juce::AudioProcessorEditor> editor(plugin->createEditorIfNeeded());

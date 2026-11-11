@@ -42,7 +42,7 @@ constexpr int NUM_TUNINGS = (int) (sizeof(TUNINGS) / sizeof(TUNINGS[0]));
 inline double midi_hz(int note) { return 440.0 * std::pow(2.0, (note - 69) / 12.0); }
 
 // below this palm pressure the palm is lifted: palm-muted notes ring free
-constexpr double PALM_OFF = 0.05;
+constexpr double PALM_OFF = 0.005;   // below: the palm does not touch the strings (above, a touch that grows)
 
 // The settings of the sound, as the Python app has them (same names, same defaults)
 struct Settings {
@@ -79,6 +79,7 @@ struct Settings {
     double room_distance = 1.0;
     // player
     bool human = true;
+    double human_amount = 1.0;    // how loose the player is (scales every imprecision of the player network; 1: its default)
     double swing_cm = SWING * 100;
     bool finger_noises = true;
     double finger_force = 0.6;   // N, pressure of a finger sliding on a string
@@ -153,7 +154,7 @@ public:
     // (3 mm, 0.15 dex), as palm_model in grm_guitar.py
     static std::pair<double, double> palm_snap(double x, double force) {
         const double xs = std::max(0.002, std::round(x * 333.3) / 333.3);
-        const double fs = std::pow(10.0, std::round(std::log10(std::max(force, 1e-3)) / 0.15) * 0.15);
+        const double fs = std::pow(10.0, std::round(std::log10(std::max(force, 1e-3)) / 0.05) * 0.05);   // 12 % steps
         return {xs, fs};
     }
     std::pair<double, double> palm_home() const {

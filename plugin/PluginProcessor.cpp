@@ -37,7 +37,7 @@ const char* const GUITAR_PARAMS[] = {
     "tuning", "string_age", "brightness", "core", "stiff", "attack", "pluck", "force", "pick", "palm_mm",
     "palm_intensity", "live_palm", "body_size", "top_mm", "coupling", "braces_g", "body_q", "body_amount", "wood",
     "density_pct", "hollow", "sensor", "pickup_mm", "pickup_type", "cable_pf", "sympathy", "room_on", "room_size",
-    "room_material", "room_distance", "human", "swing_cm", "finger_noises", "finger_force", "mix_gain", "mix_level",
+    "room_material", "room_distance", "human", "human_amount", "swing_cm", "finger_noises", "finger_force", "mix_gain", "mix_level",
     "mix_pan", "mix_mute", "mix_solo", "mix_out"};
 
 float dbToGain(float db) { return std::pow(10.0f, db / 20.0f); }
@@ -121,7 +121,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout GRMGuitarProcessor::createLa
         real("pick", "Pick (mm)", 0.4f, 1.5f, 0.71f);
         // palm
         real("palm_mm", "Palm from bridge (mm)", 5.0f, 80.0f, 30.0f);
-        real("palm_intensity", "Palm pressure (0: lifted)", 0.0f, 4.0f, 1.0f, 1.0f);
+        real("palm_intensity", "Palm pressure (0: lifted)", 0.0f, 4.0f, 1.0f, 0.3f);
         flag("live_palm", "Palm mute (live)", false);
         // body
         real("body_size", "Body size", 0.8f, 1.25f, 1.0f);
@@ -146,6 +146,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout GRMGuitarProcessor::createLa
         real("room_distance", "Listener (m)", 0.3f, 6.0f, 1.0f, 1.5f);
         // player
         flag("human", "Human feel", true);
+        real("human_amount", "Looseness (1: default)", 0.0f, 3.0f, 1.0f, 1.0f);
         real("swing_cm", "Arm swing (cm)", 4.0f, 20.0f, 10.0f);
         flag("finger_noises", "Finger noises", true);
         real("finger_force", "Finger force (N)", 0.1f, 2.0f, 0.6f, 0.6f);
@@ -167,6 +168,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout GRMGuitarProcessor::createLa
     choice("midi_mode", "MIDI keys", StringArray {"Play notes", "Play patterns"}, 0);
     flag("follow_playhead", "Roll follows the playhead", true);
     flag("ghosts", "Show the other guitars", true);
+    flag("audition", "Hear the notes written", true);
     real("tempo", "Tempo (standalone)", 40.0f, 220.0f, 90.0f, 1.0f, 1.0f);
     return {p.begin(), p.end()};
 }
@@ -228,6 +230,23 @@ void GRMGuitarProcessor::addPattern(bool duplicate) {
 
 void GRMGuitarProcessor::deletePattern() {
     current().deletePattern();
+    solver.notify();
+}
+
+void GRMGuitarProcessor::addToGuitar(int g, const grmg::Song& items) {
+    if (g < 0 || g >= guitarCount.load()) return;
+    auto& t = *tracks[(size_t) g];
+    auto song = t.getSong();
+    for (auto n : items.notes) {
+        n.selected = false;
+        song.notes.push_back(n);
+    }
+    for (auto st : items.strums) {
+        st.selected = false;
+        song.strums.push_back(st);
+    }
+    song.sort();
+    t.setSong(song);
     solver.notify();
 }
 
@@ -369,6 +388,12 @@ void GRMGuitarProcessor::exportSong(const juce::File& file) {
 // ================================================================== audio
 void GRMGuitarProcessor::prepareToPlay(double sr, int samplesPerBlock) {
     for (auto& t : tracks) t->prepare(sr, samplesPerBlock);
+    for (auto& r : rooms) {
+        r.conv = std::make_unique<juce::dsp::Convolution>(juce::dsp::Convolution::NonUniform {512});
+        r.conv->prepare({sr, (juce::uint32) samplesPerBlock, 2});
+        r.buf.setSize(2, samplesPerBlock);
+        r.key = -1;
+    }
     volume.reset(sr, 0.05);
     for (int g = 0; g < MAX_GUITARS; ++g) {
         stripGain[(size_t) g].reset(sr, 0.05);
@@ -432,19 +457,70 @@ void GRMGuitarProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         tracks[(size_t) g]->ensure(n);
         tracks[(size_t) g]->begin(patternMode, playingOwn);
     }
+    // the host stopped: what MIDI keys were holding stops too (some hosts send no note-off on stop)
+    bool hostNow = false;
+    if (auto* ph = getPlayHead())
+        if (auto pos = ph->getPosition()) hostNow = pos->getIsPlaying();
+    if (hostWasPlaying && !hostNow)
+        for (int g = 0; g < count; ++g) tracks[(size_t) g]->releaseKeys();
+    hostWasPlaying = hostNow;
+    // where MIDI goes: by channel (channel k: guitar k), or to the selected guitar; in "Play patterns" a key starts
+    // its pattern on every guitar that has one (a scene), unless the channels choose the guitar
     const bool byChannel = params.getRawParameterValue("midi_route")->load() > 0.5f;
     const int sel = juce::jlimit(0, count - 1, selected.load());
     for (const auto meta : midi) {
         const auto msg = meta.getMessage();
+        const int at = juce::jlimit(0, n, meta.samplePosition);
+        if (patternMode && !playingOwn && !byChannel) {
+            for (int g = 0; g < count; ++g) {
+                tracks[(size_t) g]->renderTo(at, clock);
+                tracks[(size_t) g]->midi(msg);
+            }
+            continue;
+        }
         const int target = byChannel && msg.getChannel() >= 1 && msg.getChannel() <= count ? msg.getChannel() - 1 : sel;
         auto& t = *tracks[(size_t) target];
-        t.renderTo(juce::jlimit(0, n, meta.samplePosition), clock);
+        t.renderTo(at, clock);
         t.midi(msg);
+    }
+    // the rooms: guitars in the same room, going to the same output, share one (it costs as much as the strings)
+    for (auto& r : rooms) {
+        r.used = false;
+        if (r.buf.getNumSamples() < n) r.buf.setSize(2, n, false, false, true);
+        r.buf.clear();
+    }
+    const int tailBlocks = (int) (4.0 * sr / juce::jmax(1, n));       // a room rings on after its guitars stop
+    for (int g = 0; g < count; ++g) {
+        auto& t = *tracks[(size_t) g];
+        roomOf[(size_t) g] = -1;
+        const long key = t.roomKey();
+        if (key < 0) continue;
+        const int bus = t.param("mix_out") > 0.5f ? g + 1 : 0;
+        int slot = -1;
+        for (int k = 0; k < MAX_GUITARS && slot < 0; ++k)
+            if (rooms[(size_t) k].key == key && rooms[(size_t) k].bus == bus) slot = k;
+        if (slot < 0)                                // a free room (or one whose tail has died out)
+            for (int k = 0; k < MAX_GUITARS && slot < 0; ++k)
+                if (rooms[(size_t) k].conv && (rooms[(size_t) k].key < 0 || rooms[(size_t) k].idle > tailBlocks))
+                    if (auto* share = t.roomShare()) {
+                        rooms[(size_t) k].conv->loadImpulseResponse(std::move(*share), sr, juce::dsp::Convolution::Stereo::yes,
+                                                                    juce::dsp::Convolution::Trim::no,
+                                                                    juce::dsp::Convolution::Normalise::no);
+                        share->setSize(0, 0);
+                        rooms[(size_t) k].conv->reset();
+                        rooms[(size_t) k].key = key;
+                        rooms[(size_t) k].bus = bus;
+                        rooms[(size_t) k].idle = 0;
+                        slot = k;
+                    }
+        roomOf[(size_t) g] = slot >= 0 ? slot : -2;   // no room to share yet: its own
+        if (slot >= 0) rooms[(size_t) slot].used = true;
     }
     for (int g = 0; g < count; ++g) {
         tracks[(size_t) g]->renderTo(n, clock);
-        tracks[(size_t) g]->finish(n, sr);
+        tracks[(size_t) g]->finish(n, sr, roomOf[(size_t) g] == -2);
     }
+    songBeat.store(clock.playing ? (clock.host ? clock.beat : clock.start + clock.beat) : -1.0);
     if (!clock.host && clock.playing) {
         internalElapsed += n * clock.beats_per_sample;
         if (!clock.loop) {                        // the end of the longest guitar, and 4 s of ringing
@@ -472,7 +548,10 @@ void GRMGuitarProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         stripGain[(size_t) g].setTargetValue(silent ? 0.0f : dbToGain(t.param("mix_gain")) * t.param("mix_level"));
         stripPan[(size_t) g].setTargetValue(t.param("mix_pan"));
         const bool own = t.param("mix_out") > 0.5f && usable(g + 1);
-        auto bus = own ? getBusBuffer(buffer, false, g + 1) : mainBus;
+        const int room = roomOf[(size_t) g];
+        juce::AudioBuffer<float> roomBuf;
+        if (room >= 0) roomBuf.setDataToReferTo(rooms[(size_t) room].buf.getArrayOfWritePointers(), 2, n);
+        auto bus = room >= 0 ? roomBuf : own ? getBusBuffer(buffer, false, g + 1) : mainBus;
         const float* l = t.out.getReadPointer(0);
         const float* r = t.out.getReadPointer(1);
         for (int k = 0; k < n; ++k) {
@@ -486,6 +565,18 @@ void GRMGuitarProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
                 bus.addSample(1, k, gr * r[k]);
             }
         }
+    }
+    // the shared rooms, each into its output
+    for (auto& r : rooms) {
+        if (r.key < 0 || !r.conv) continue;
+        r.idle = r.used ? 0 : r.idle + 1;
+        if (r.idle > tailBlocks) continue;
+        juce::dsp::AudioBlock<float> block(r.buf.getArrayOfWritePointers(), 2, (size_t) n);
+        r.conv->process(juce::dsp::ProcessContextReplacing<float>(block));
+        auto out = r.bus > 0 && usable(r.bus) ? getBusBuffer(buffer, false, r.bus) : mainBus;
+        for (int ch = 0; ch < out.getNumChannels(); ++ch)
+            out.addFrom(ch, 0, r.buf, juce::jmin(ch, 1), 0, n, out.getNumChannels() == 1 ? 0.5f : 1.0f);
+        if (out.getNumChannels() == 1) out.addFrom(0, 0, r.buf, 1, 0, n, 0.5f);
     }
     // the main output's volume, then a peak limiter on every output that only acts above LIMIT and lowers the gain
     // smoothly instead of bending the wave

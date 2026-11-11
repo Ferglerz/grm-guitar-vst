@@ -57,6 +57,7 @@ grmg::Settings GuitarTrack::readSettings() const {
     s.room_material = juce::jlimit(0, 5, c("room_material"));
     s.room_distance = std::round(v("room_distance") * 10.0) / 10.0;
     s.human = b("human");
+    s.human_amount = std::round(v("human_amount") * 20.0) / 20.0;
     s.swing_cm = v("swing_cm");
     s.finger_noises = b("finger_noises");
     s.finger_force = v("finger_force");
@@ -156,6 +157,7 @@ GuitarTrack::ModelHolder* GuitarTrack::makeHolder(std::shared_ptr<const grmg::Mo
         h->room.setSize(2, (int) m->room_ir[0].size());
         for (int ch = 0; ch < 2; ++ch)
             std::copy(m->room_ir[(size_t) ch].begin(), m->room_ir[(size_t) ch].end(), h->room.getWritePointer(ch));
+        h->roomShare.makeCopyOf(h->room);
     }
     return h;
 }
@@ -167,7 +169,7 @@ void GuitarTrack::solveStep(double sr, unsigned seed, double tempo, bool loop, s
         return M::same_strings(a, b) && M::same_attack(a, b) && M::same_palm(a, b) && M::same_body(a, b) && M::same_room(a, b);
     };
     auto samePlayer = [](const grmg::Settings& a, const grmg::Settings& b) {
-        return a.human == b.human && std::abs(a.swing_cm - b.swing_cm) < 1e-9 && a.finger_noises == b.finger_noises
+        return a.human == b.human && std::abs(a.human_amount - b.human_amount) < 1e-9 && std::abs(a.swing_cm - b.swing_cm) < 1e-9 && a.finger_noises == b.finger_noises
                && std::abs(a.finger_force - b.finger_force) < 1e-9;
     };
     collect();
@@ -230,6 +232,7 @@ void GuitarTrack::solveStep(double sr, unsigned seed, double tempo, bool loop, s
         try {
             grmg::Settings ps = model->s;          // the player settings of now, with the model's networks
             ps.human = s.human;
+            ps.human_amount = s.human_amount;
             ps.swing_cm = s.swing_cm;
             ps.finger_noises = s.finger_noises;
             ps.finger_force = s.finger_force;
@@ -277,6 +280,7 @@ void GuitarTrack::prepare(double sr, int block) {
 
 void GuitarTrack::begin(bool patternModeNow, bool internalPlaying) {
     if (auto* h = modelBox.take()) {
+        holder = h;
         engine.set_model(h->model.get());
         // impulse responses built by the solver: loading them is wait-free (juce::dsp::Convolution)
         if (h->model->body_id != loadedBody && h->body.getNumSamples() > 0) {
@@ -295,7 +299,9 @@ void GuitarTrack::begin(bool patternModeNow, bool internalPlaying) {
     patternMode = patternModeNow;
     keys = patternMode && !internalPlaying;
     if (!keys) {
-        engine.set_performance(perfSet ? perfSet->at(editing.load()) : nullptr);
+        const int k = editing.load();
+        engine.set_performance(perfSet ? perfSet->at(k) : nullptr, k != shownPattern);   // another pattern: carry the endings
+        shownPattern = k;
         heldKey = heldPattern = -1;
     } else if (heldPattern >= 0) {
         engine.set_performance(perfSet ? perfSet->at(heldPattern) : nullptr);
@@ -332,7 +338,7 @@ void GuitarTrack::midi(const juce::MidiMessage& msg) {
                 heldKey = msg.getNoteNumber();
                 heldPattern = k;
                 patternBeat = 0.0;
-                engine.set_performance(perfSet->at(k));
+                engine.set_performance(perfSet->at(k), true);     // the old pattern's notes end as they were asked
             }
         } else if (msg.isNoteOff() && msg.getNoteNumber() == heldKey) {
             heldKey = heldPattern = -1;
@@ -345,6 +351,11 @@ void GuitarTrack::midi(const juce::MidiMessage& msg) {
     if (msg.isNoteOn()) engine.note_on(msg.getNoteNumber(), msg.getFloatVelocity(), msg.getChannel());
     else if (msg.isNoteOff()) engine.note_off(msg.getNoteNumber());
     else if (msg.isAllNotesOff() || msg.isAllSoundOff()) engine.all_off();
+}
+
+void GuitarTrack::releaseKeys() {
+    if (heldPattern >= 0 || heldKey >= 0) engine.all_off();
+    heldKey = heldPattern = -1;
 }
 
 void GuitarTrack::renderTo(int at, const SongClock& clock) {
@@ -378,7 +389,33 @@ void GuitarTrack::renderTo(int at, const SongClock& clock) {
     pos = at;
 }
 
-void GuitarTrack::finish(int n, double sr) {
+long GuitarTrack::roomKey() const {
+    const auto* m = engine.model();
+    if (!m || !m->s.room_on || m->s.sensor != 0) return -1;
+    return 1 + m->s.room_size + 4L * m->s.room_material + 24L * std::lround(m->s.room_distance * 10.0)
+           + 24L * 1000L * std::lround(m->sample_rate);
+}
+
+juce::AudioBuffer<float>* GuitarTrack::roomShare() {
+    return holder && holder->roomShare.getNumSamples() > 0 ? &holder->roomShare : nullptr;
+}
+
+void GuitarTrack::finish(int n, double sr, bool ownRoom) {
+    // a value that is not a number would silence the convolutions for good: start the strings again instead
+    {
+        float* d0 = dry.getWritePointer(0);
+        bool bad = false;
+        for (int t = 0; t < n; ++t) bad |= !std::isfinite(d0[t]);
+        if (bad) {
+            dry.clear();
+            pickupBuf.clear();
+            engine.all_off();
+            engine.reset_strings();
+            bodyConv.reset();
+            roomConv.reset();
+            pickupFilter.z1 = pickupFilter.z2 = 0.0;
+        }
+    }
     const auto* model = engine.model();
     const int sensor = model ? model->s.sensor : 0;
     const float* d = dry.getReadPointer(0);
@@ -414,7 +451,7 @@ void GuitarTrack::finish(int n, double sr) {
         w0[t] = OUTPUT_SCALE * ((1.0f - a) * d[t] + a * w0[t]);
     }
     out.copyFrom(1, 0, out, 0, 0, n);
-    if (model && model->s.room_on && roomLoaded) {
+    if (ownRoom && model && model->s.room_on && roomLoaded) {
         juce::dsp::AudioBlock<float> block(out.getArrayOfWritePointers(), 2, (size_t) n);
         roomConv.process(juce::dsp::ProcessContextReplacing<float>(block));
     }

@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
     const double held = run(1.5, [](juce::MidiBuffer& m, int pos) {
         if (pos == 0) m.addEvent(juce::MidiMessage::noteOn(1, GRMGuitarProcessor::PATTERN_KEY + 1, (juce::uint8) 100), 10);
     });
+    std::printf("hollow body, microphone: %.3g\n", held);
     check("a key plays its pattern", held > 20 * quiet + 1e-5);
     check("the playing pattern is pattern 2", g->getPlayingPattern() == 1);
     run(0.1, [](juce::MidiBuffer& m, int pos) {
@@ -153,6 +154,18 @@ int main(int argc, char** argv) {
         check(sensor == 1 ? "a magnetic pickup on a solid body sounds" : "a piezo sounds", std::isfinite(level) && level > 20 * quiet + 1e-5);
     }
     g->params.getParameter("sensor")->setValueNotifyingHost(0.0f);
+    {   // a solid body heard by the microphone (it went silent in a host)
+        run(4.0, none);
+        const double level = run(1.5, [](juce::MidiBuffer& m, int pos) {
+            if (pos == 0) m.addEvent(juce::MidiMessage::noteOn(1, GRMGuitarProcessor::PATTERN_KEY + 1, (juce::uint8) 100), 10);
+        });
+        run(0.1, [](juce::MidiBuffer& m, int pos) {
+            if (pos == 0) m.addEvent(juce::MidiMessage::noteOff(1, GRMGuitarProcessor::PATTERN_KEY + 1), 0);
+        });
+        std::printf("solid body, microphone: %.3g\n", level);
+        check("a solid body heard by the microphone sounds", std::isfinite(level) && level > 20 * quiet + 1e-5);
+        run(3.0, none);
+    }
     g->params.getParameter("hollow")->setValueNotifyingHost(1.0f);
     // the patterns are saved with the session
     juce::MemoryBlock saved;
@@ -224,6 +237,12 @@ int main(int argc, char** argv) {
     {
         const int channels = plugin->getTotalNumOutputChannels();
         juce::AudioBuffer<float> all(channels, block);
+        g->params.getParameter("mix_mute")->setValueNotifyingHost(1.0f);   // only guitar 2 (muted before it plays)
+        for (int k = 0; k < 40; ++k) {
+            all.clear();
+            midi.clear();
+            plugin->processBlock(all, midi);
+        }
         g->setInternalPlaying(true);
         double mainE = 0, ownE = 0;
         for (int k = 0; k < 200; ++k) {
@@ -237,6 +256,7 @@ int main(int argc, char** argv) {
         }
         g->setInternalPlaying(false);
         g->params.getParameter("mix_mute")->setValueNotifyingHost(0.0f);
+        std::printf("own output %.4g, main %.4g, channels %d\n", ownE, mainE, channels);
         check("guitar 2 on its own output, not in the main one", channels == 18 && ownE > 20 * mainE + 1e-6);
     }
     // the guitars and their patterns come back with the session; removing guitar 1 moves guitar 2 down

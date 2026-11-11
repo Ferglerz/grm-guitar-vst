@@ -91,8 +91,15 @@ public:
     void begin(bool patternMode, bool internalPlaying);   // takes the newest networks and performances
     // MIDI for this guitar, at sample `at` of the block (render up to there first with renderTo)
     void midi(const juce::MidiMessage& msg);
+    void releaseKeys();                           // the host stopped: patterns held by keys stop too
     void renderTo(int at, const SongClock& clock);
-    void finish(int n, double sr);                // body/room or pickup: the stereo `out`, before the mixer
+    // body (and the room if ownRoom) or pickup: the stereo `out`, before the mixer. The plugin shares one room
+    // among the guitars that have the same one (ownRoom false): it is the heaviest part of the sound.
+    void finish(int n, double sr, bool ownRoom);
+    // which room this guitar is in (-1: none): guitars with the same key can share one room
+    long roomKey() const;
+    // a copy of this guitar's room response for the shared room (null once taken, until the next networks)
+    juce::AudioBuffer<float>* roomShare();
     juce::AudioBuffer<float> out;                 // this block, stereo, at the output scale
     grmg::Engine engine;
     int playingPattern() const { return playing.load(); }
@@ -113,8 +120,9 @@ private:
     // solver state
     struct ModelHolder {
         std::shared_ptr<const grmg::Model> model;
-        juce::AudioBuffer<float> body, room;
+        juce::AudioBuffer<float> body, room, roomShare;
     };
+    ModelHolder* holder = nullptr;               // the networks in use (audio thread)
     static ModelHolder* makeHolder(std::shared_ptr<const grmg::Model> m);
     grmg::Mailbox<ModelHolder> modelBox;
     grmg::Mailbox<PerformanceSet> perfBox;
@@ -141,7 +149,7 @@ private:
     juce::SmoothedValue<float> bodyMix;
     grmg::Biquad pickupFilter;
     double filterFr = -1.0, filterQ = -1.0;
-    int heldKey = -1, heldPattern = -1;
+    int heldKey = -1, heldPattern = -1, shownPattern = -1;
     double patternBeat = 0.0;
     int pos = 0;
 

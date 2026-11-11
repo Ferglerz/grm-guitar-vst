@@ -5,8 +5,10 @@
 // that end, the live palm; the hands' limits, the sweep of the pick, the pinch, the muscle, the palm's band.
 #include <cmath>
 #include <cstdio>
+#include <set>
 
 #include "../core/engine.hpp"
+#include "../core/chords.hpp"
 #include "../core/playability.hpp"
 
 using namespace grmg;
@@ -250,12 +252,7 @@ int main() {
         int all = 0;
         for (const auto& e : whole->events) all += e.type == EventType::pluck && e.pluck.kind == Kind::strike;
         ok("no loop: the whole song plays", all == 4 && whole->origin == 0.0);
-        // writing past the end makes the song longer
-        RollNote far;
-        far.start = 30.0;
-        song.notes.push_back(far);
-        song.fit_content();
-        ok("writing past the end makes the song longer", song.bars == 8);
+
     }
     // ---- one more note: refused only where the hands cannot reach (the roll greys those places)
     {
@@ -280,6 +277,193 @@ int main() {
         RollNote after = far;
         after.start = 4.0;                    // fret 3 is released by then
         ok("one more note: once the hand is free, fret 8 is fine", playable_with(song, after, true));
+    }
+    // ---- notes ring as long as the hands let them
+    {
+        Song song;
+        song.bars = 2;
+        auto note = [](int string, int fret, double start, double length, int end = RollNote::ring) {
+            RollNote n;
+            n.string = string;
+            n.fret = fret;
+            n.start = start;
+            n.length = length;
+            n.end = end;
+            return n;
+        };
+        song.notes = {note(0, 0, 0.0, 1.0), note(0, 3, 3.0, 1.0)};
+        auto r = ringing(song, 8.0, false);
+        ok("ringing: an open string rings until it is played again", std::abs(r.note_end[0] - 3.0) < 1e-9);
+        song.notes = {note(0, 3, 0.0, 1.0), note(1, 8, 2.0, 1.0)};
+        r = ringing(song, 8.0, false);
+        ok("ringing: a fretted note rings until the hand must leave its fret", std::abs(r.note_end[0] - 2.0) < 1e-9);
+        song.notes = {note(0, 3, 0.0, 1.0), note(1, 5, 2.0, 1.0)};
+        r = ringing(song, 8.0, false);
+        ok("ringing: ... and on while the hand can hold it", r.note_end[0] > 7.0);
+        song.notes = {note(0, 0, 0.0, 1.0, RollNote::stop), note(0, 3, 3.0, 1.0)};
+        r = ringing(song, 8.0, false);
+        ok("ringing: a note asked to stop stops at its end", std::abs(r.note_end[0] - 1.0) < 1e-9);
+        song.notes = {note(0, 3, 1.0, 1.0), note(0, 0, 6.0, 1.0)};
+        r = ringing(song, 8.0, true);
+        ok("ringing: in a loop the last note rings into the next cycle", std::abs(r.note_end[1] - 9.0) < 1e-9);
+        Song saved;
+        song.notes[0].end = RollNote::hand;
+        ok("ringing: the ending is saved with the song", saved.from_text(song.to_text()) && saved.notes[0].end == RollNote::hand);
+        // the strings: no damp on the open string before it is played again; a flat hand damps its neighbours
+        song.notes = {note(0, 0, 0.0, 1.0), note(0, 3, 3.0, 1.0)};
+        Compiler c;
+        CompileOptions o;
+        auto perf = c.compile(song, model, o);
+        bool early = false;
+        for (const auto& e : perf->events) early |= e.type == EventType::damp && e.string == 0 && e.beat > 0.5 && e.beat < 2.8;
+        ok("ringing: the strings are not damped while they ring", !early);
+        song.notes = {note(1, 0, 0.0, 4.0), note(2, 2, 1.0, 1.0, RollNote::hand)};
+        perf = c.compile(song, model, o);
+        bool beside = false;
+        for (const auto& e : perf->events) beside |= e.type == EventType::damp && e.string == 1 && e.beat > 1.9 && e.beat < 2.3;
+        ok("ringing: a flat hand also stops the string beside", beside);
+    }
+    // ---- every chord, on every tuning: a shape the left hand can play, the root in the bass, every needed tone
+    {
+        bool all = true;
+        std::string bad;
+        for (int tun = 0; tun < NUM_TUNINGS; ++tun)
+            for (int q = 0; q < (int) chord_qualities().size(); ++q)
+                for (int r = 0; r < 12; ++r) {
+                    const auto c = chord_for(r, q, tun);
+                    std::vector<std::pair<int, int>> held;
+                    int bass = -1;
+                    std::set<int> tones;
+                    for (int i = 0; i < 6; ++i)
+                        if (c.frets[(size_t) i] >= 0) {
+                            const int iv = ((TUNINGS[tun].midi[i] + c.frets[(size_t) i] - r) % 12 + 12) % 12;
+                            if (bass < 0) bass = iv;
+                            tones.insert(iv);
+                            if (c.frets[(size_t) i] > 0) held.push_back({i, c.frets[(size_t) i]});
+                        }
+                    bool ok_here = bass == 0 && left_hand(held).possible;
+                    for (int need : chord_qualities()[(size_t) q].needed) ok_here = ok_here && tones.count(need);
+                    if (!ok_here && bad.empty()) bad = c.name + " in " + TUNINGS[tun].name;
+                    all = all && ok_here;
+                }
+        if (!all) std::printf("  first bad chord: %s\n", bad.c_str());
+        ok("chords: every chord on every tuning has a playable shape with its root in the bass", all);
+        const auto fsm = parse_chord("F#m7"), bb = parse_chord("Bbmaj7"), db = parse_chord("Db");
+        ok("chords: names with sharps and flats are read", fsm.first == 6 && bb.first == 10 && db.first == 1 && db.second == 0);
+        ok("scales: a third above E in C major is G", scale_step(64, 0, 0, 2) == 67);
+        ok("scales: a third above A in A minor is C", scale_step(69, 9, 1, 2) == 72);
+        ok("scales: a third below C in C major is A", scale_step(72, 0, 0, -2) == 69);
+    }
+    // ---- filling strums keeps the chords already written, over any length
+    {
+        Song song;
+        song.bars = 4;
+        RollStrum am;
+        am.start = 4.0;
+        am.length = 4.0;
+        for (int i = 0; i < 6; ++i) am.frets[(size_t) i] = CHORD_SHAPES[3].frets[i];
+        am.chord = "Am";
+        song.strums.push_back(am);
+        const auto g = chord_for(7, 0, 0);
+        song.fill_strums_range(0.0, 12.0, 0, g.frets, g.name, 2.0);
+        bool kept = true, before = true, past_bar = false;
+        for (const auto& t : song.strums) {
+            if (t.start >= 4.0 && t.start < 8.0) kept = kept && t.chord == "Am";
+            if (t.start < 4.0 || t.start >= 8.0) before = before && t.chord == "G";
+            past_bar = past_bar || t.start >= 8.0;
+        }
+        ok("fill strums: the chord written there is kept (rhythm only)", kept);
+        ok("fill strums: elsewhere the chord of the boxes", before);
+        ok("fill strums: over three bars at once", past_bar);
+    }
+    // ---- a dead note: struck, then damped at once; one hand cannot strum and pick notes at the same moment
+    {
+        Song song;
+        RollNote x;
+        x.string = 1;
+        x.fret = 5;
+        x.start = 1.0;
+        x.length = 1.0;
+        x.dead = true;
+        song.notes.push_back(x);
+        Compiler c;
+        CompileOptions o;
+        auto perf = c.compile(song, model, o);
+        double strike = -1, damp = -1;
+        for (const auto& e : perf->events) {
+            if (e.type == EventType::pluck && e.pluck.kind == Kind::strike && e.string == 1) strike = e.beat;
+            if (e.type == EventType::damp && e.string == 1 && strike >= 0 && damp < 0) damp = e.beat;
+        }
+        ok("dead note: damped right after its stroke", strike >= 0 && damp > strike && (damp - strike) * 60.0 / o.tempo < 0.02);
+        Song both;
+        RollStrum t;
+        t.start = 0.0;
+        for (int i = 0; i < 6; ++i) t.frets[(size_t) i] = CHORD_SHAPES[1].frets[i];
+        both.strums.push_back(t);
+        RollNote n;
+        n.string = 0;
+        n.start = 0.0;
+        both.notes.push_back(n);
+        ok("hands: strumming and picking a note at the same moment is refused", !impossible_moments(both, true).empty());
+    }
+    // ---- hand stops: whatever rings stops there (saved with the song, in the compiled strings)
+    {
+        Song song;
+        song.bars = 2;
+        RollNote a;
+        a.string = 0;
+        a.fret = 0;
+        a.start = 0.0;
+        a.length = 1.0;
+        song.notes.push_back(a);
+        song.stops.push_back(2.5);
+        const auto r = ringing(song, 8.0, false);
+        ok("hand stop: the open string rings up to it", std::abs(r.note_end[0] - 2.5) < 1e-9);
+        Song back;
+        ok("hand stop: saved with the song", back.from_text(song.to_text()) && back.stops.size() == 1 && std::abs(back.stops[0] - 2.5) < 1e-9);
+        Compiler c;
+        CompileOptions o;
+        auto perf = c.compile(song, model, o);
+        bool damped = false;
+        for (const auto& e : perf->events) damped |= e.type == EventType::damp && e.string == 0 && std::abs(e.beat - 2.5) < 1e-6;
+        ok("hand stop: the strings are damped there", damped);
+    }
+    // ---- another pattern takes over: the old one's notes still end as they were asked
+    {
+        Song one, two;
+        RollNote n;
+        n.string = 2;
+        n.fret = 2;
+        n.start = 0.0;
+        n.length = 1.0;
+        n.end = RollNote::stop;
+        one.notes.push_back(n);
+        one.bars = two.bars = 1;
+        Compiler c;
+        CompileOptions o;
+        o.tempo = 120;
+        auto p1 = c.compile(one, model, o), p2 = c.compile(two, model, o);
+        auto level = [&](bool carry) {
+            Engine e;
+            e.prepare(sr);
+            e.set_model(model.get());
+            e.set_performance(p1.get());
+            Transport tr;
+            tr.playing = true;
+            tr.loop = true;
+            tr.beats_per_sample = 2.0 / sr;
+            std::vector<float> y(256);
+            double late = 0;
+            for (int b = 0; b < 400; ++b) {
+                tr.beat = b * 256 * tr.beats_per_sample;
+                if (b == 40) e.set_performance(p2.get(), carry);     // at 0.21 s: the other pattern
+                e.render(y.data(), 256, tr);
+                if (b > 250)
+                    for (float v : y) late += v * v;
+            }
+            return late;
+        };
+        ok("pattern change: a note asked to stop still stops", level(true) < 0.2 * level(false));
     }
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

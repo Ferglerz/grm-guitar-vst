@@ -19,6 +19,13 @@
 
 namespace grmg {
 
+// the products of the audio loops, written out: std::complex's operator* checks for infinities and NaN on every
+// call (C99 Annex G), several times slower in the loops that run for every mode at every sample
+inline cplx cmul(cplx a, cplx b) {
+    return {a.real() * b.real() - a.imag() * b.imag(), a.real() * b.imag() + a.imag() * b.real()};
+}
+inline double cmul_re(cplx a, cplx b) { return a.real() * b.real() - a.imag() * b.imag(); }
+
 // Fourier amplitudes of a string released from a triangle with its apex at p (share of the length)
 inline double pluck_amplitude(int n, double p) {
     p = std::min(std::max(p, 0.02), 0.98);
@@ -153,8 +160,8 @@ public:
                 for (int k = 0; k < count_; ++k) {
                     const size_t m = (size_t) k;
                     sum += z_[m].real() * g_[m];
-                    if (pickup) heard += (z_[m] * pick_[m]).real() * g_[m];
-                    z_[m] *= step_[m];
+                    if (pickup) heard += cmul_re(z_[m], pick_[m]) * g_[m];
+                    z_[m] = cmul(z_[m], step_[m]);
                 }
                 if (t_ + 1 == regain_end_) {                       // from now on the palm is back
                     const double e5 = std::exp(-5.0);
@@ -164,8 +171,8 @@ public:
             } else {
                 for (int k = 0; k < count_; ++k) {
                     sum += z_[(size_t) k].real();
-                    if (pickup) heard += (z_[(size_t) k] * pick_[(size_t) k]).real();
-                    z_[(size_t) k] *= step_[(size_t) k];
+                    if (pickup) heard += cmul_re(z_[(size_t) k], pick_[(size_t) k]);
+                    z_[(size_t) k] = cmul(z_[(size_t) k], step_[(size_t) k]);
                 }
             }
             for (int k = 0; k < over_; ++k) {
@@ -252,9 +259,9 @@ public:
             const double x = in[t];
             for (int k = 0; k < count_; ++k) {
                 const size_t m = (size_t) k;
-                z_[m] = z_[m] * step_[m] + drive_[m] * x;
+                z_[m] = cmul(z_[m], step_[m]) + drive_[m] * x;
                 sum += z_[m].real();
-                if (pickup) heard += (z_[m] * pick_[m]).real();
+                if (pickup) heard += cmul_re(z_[m], pick_[m]);
             }
             if (level_ < target_) level_ = std::min(target_, level_ + fade_step_);
             else if (level_ > target_) level_ = std::max(target_, level_ - fade_step_);

@@ -129,7 +129,8 @@ inline std::vector<Problem> impossible_moments(const Song& song, bool pick, bool
         std::vector<int> struck;
         bool strum_here = false;
         for (const auto& n : song.notes) {
-            if (n.start <= t + 1e-9 && t < n.start + n.length - 1e-9) held.push_back({n.string, n.fret});
+            // a dead note: a finger only rests on the string (no fret to hold)
+            if (!n.dead && n.start <= t + 1e-9 && t < n.start + n.length - 1e-9) held.push_back({n.string, n.fret});
             if (std::abs(n.start - t) < 1e-9) struck.push_back(n.string);
         }
         for (const auto& s : song.strums)
@@ -151,6 +152,8 @@ inline std::vector<Problem> impossible_moments(const Song& song, bool pick, bool
         if (!strum_here) {
             const std::string why = right_hand(struck, pick);
             if (!why.empty()) out.push_back({t, "right hand: " + why});
+        } else if (!struck.empty()) {
+            out.push_back({t, "right hand: one hand cannot strum and pick single notes at the same moment"});
         }
     }
     return out;

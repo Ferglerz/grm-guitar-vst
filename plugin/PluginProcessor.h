@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -50,7 +51,9 @@ public:
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 6.0; }
+    // the strings may ring as long as the hands let them, and the plugin plays its own roll: an endless tail tells
+    // the host never to put it to sleep (some hosts stop calling an instrument that gets no input)
+    double getTailLengthSeconds() const override { return std::numeric_limits<double>::infinity(); }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -92,6 +95,9 @@ public:
     int getPlayingPattern() const { return current().playingPattern(); }
     static juce::String patternKeyName(int k) { return juce::MidiMessage::getMidiNoteName(PATTERN_KEY + k, true, true, 3); }
     // a pattern copied from any guitar, pasted into any other (as a new pattern after the one being edited)
+    // notes and strums added to another guitar's pattern being edited (copy to guitar)
+    void addToGuitar(int g, const grmg::Song& items);
+    double getSongBeat() const { return songBeat.load(); }   // where the song is (host or Play), -1 stopped
     void copyPattern();
     bool pastePattern();
     bool hasCopiedPattern() const;
@@ -143,6 +149,17 @@ private:
     mutable std::mutex clipLock;
     juce::String copiedPattern;
 
+    // the shared rooms: one convolution for all the guitars in the same room going to the same output
+    struct RoomGroup {
+        long key = -1;
+        int bus = 0, idle = 0;
+        bool used = false;
+        std::unique_ptr<juce::dsp::Convolution> conv;
+        juce::AudioBuffer<float> buf;
+    };
+    std::array<RoomGroup, MAX_GUITARS> rooms;
+    std::array<int, MAX_GUITARS> roomOf {};       // per guitar this block: its shared room, -1 none, -2 its own
+
     // mixer (audio thread)
     juce::SmoothedValue<float> volume;
     std::array<juce::SmoothedValue<float>, MAX_GUITARS> stripGain, stripPan;
@@ -152,6 +169,8 @@ private:
     std::atomic<bool> internalPlaying {false}, hostPlaying {false};
     std::atomic<double> internalSeek {-1.0};
     double internalStart = 0.0, internalElapsed = 0.0;
+    bool hostWasPlaying = false;
+    std::atomic<double> songBeat {-1.0};
 
     // audio thread -> interface: the oscilloscope
     juce::AbstractFifo scopeFifo {8192};

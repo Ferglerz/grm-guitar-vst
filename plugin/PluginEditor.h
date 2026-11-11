@@ -122,7 +122,9 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> volumeAttachment;
 
     // tools of the roll
-    juce::ComboBox chordBox, strumBox, arpBox, snapBox, barsBox, fillCount;
+    juce::ComboBox rootBox, qualityBox, strumBox, arpBox, snapBox, barsBox, fillCount;
+    juce::ComboBox keyBox, scaleBox;          // the key and scale of the pattern (harmonizing)
+    juce::Label keyLabel;
     juce::TextButton fillStrums {"Fill strums"}, fillArp {"Fill arpeggio"}, clearBar {"Clear bar"}, undoButton {"Undo"},
         redoButton {"Redo"}, demoButton {"Demo song"};
     juce::Label chordLabel, barLabel, snapLabel, songLabel, help;

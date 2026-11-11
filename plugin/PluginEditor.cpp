@@ -287,9 +287,27 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
     addAndMakeVisible(volume);
 
     // ---------------------------------------------------------------- tools of the roll
-    for (int c = 0; c < NUM_CHORDS; ++c) chordBox.addItem(CHORD_SHAPES[c].name, c + 1);
-    chordBox.setSelectedId(roll.chord + 1, juce::dontSendNotification);
-    chordBox.onChange = [this] { roll.chord = chordBox.getSelectedId() - 1; };
+    for (int r = 0; r < 12; ++r) rootBox.addItem(grmg::ROOT_LABELS[r], r + 1);
+    rootBox.setSelectedId(roll.chordRoot + 1, juce::dontSendNotification);
+    rootBox.onChange = [this] { roll.chordRoot = rootBox.getSelectedId() - 1; };
+    for (int q = 0; q < (int) grmg::chord_qualities().size(); ++q) qualityBox.addItem(grmg::chord_qualities()[(size_t) q].label, q + 1);
+    qualityBox.setSelectedId(roll.chordQuality + 1, juce::dontSendNotification);
+    qualityBox.onChange = [this] { roll.chordQuality = qualityBox.getSelectedId() - 1; };
+    rootBox.setTooltip("The chord of new strums and fills: its root (sharps and flats)");
+    qualityBox.setTooltip("The chord's kind. Its shape is chosen by the left-hand network for this guitar's tuning");
+    for (int r = 0; r < 12; ++r) keyBox.addItem(grmg::ROOT_LABELS[r], r + 1);
+    for (int k = 0; k < (int) grmg::scales().size(); ++k) scaleBox.addItem(grmg::scales()[(size_t) k].name, k + 1);
+    keyBox.setTooltip("The key of this pattern: harmonizing (right click on notes) follows it");
+    scaleBox.setTooltip("The scale of this pattern: harmonizing follows it");
+    keyBox.onChange = [this] {
+        const int k = keyBox.getSelectedId() - 1;
+        if (k >= 0 && k != roll.getSong().key) roll.edit([k](Song& s) { s.key = k; }, false);
+    };
+    scaleBox.onChange = [this] {
+        const int k = scaleBox.getSelectedId() - 1;
+        if (k >= 0 && k != roll.getSong().scale) roll.edit([k](Song& s) { s.scale = k; }, false);
+    };
+    keyLabel.setText("Key", juce::dontSendNotification);
     for (int k = 0; k < NUM_STRUM_PATTERNS; ++k) strumBox.addItem(STRUM_PATTERNS[k].name, k + 1);
     strumBox.setSelectedId(2, juce::dontSendNotification);
     for (int k = 0; k < NUM_ARPEGGIO_PATTERNS; ++k) arpBox.addItem(ARPEGGIO_PATTERNS[k].name, k + 1);
@@ -306,15 +324,28 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
     };
     for (int b : {1, 2, 4, 8}) fillCount.addItem("x " + juce::String(b), b);
     fillCount.setSelectedId(1, juce::dontSendNotification);
-    fillStrums.onClick = [this] {
-        const int bar = roll.currentBar, count = std::max(1, fillCount.getSelectedId()), pattern = strumBox.getSelectedId() - 1;
-        const int chord = roll.chord;
-        roll.edit([=](Song& s) { s.fill_strums(bar, std::min(count, grmg::Song::MAX_BARS - bar), pattern, chord, 2.0); });
+    // Fill: over the selection when there is one (any length), else over the bars from the current one. The chords
+    // already written there are kept: the pattern gives the rhythm; elsewhere the chord of the boxes.
+    auto fillRange = [this](double& from, double& to) {
+        if (roll.selectionRange(from, to)) return;
+        const auto& s = roll.getSong();
+        const int bar = roll.currentBar, count = std::max(1, fillCount.getSelectedId());
+        from = bar * s.beats_per_bar;
+        to = std::min(grmg::Song::MAX_BARS, bar + count) * s.beats_per_bar;
     };
-    fillArp.onClick = [this] {
-        const int bar = roll.currentBar, count = std::max(1, fillCount.getSelectedId()), pattern = arpBox.getSelectedId() - 1;
-        const int chord = roll.chord;
-        roll.edit([=](Song& s) { s.fill_arpeggio(bar, std::min(count, grmg::Song::MAX_BARS - bar), pattern, chord, 2.0); });
+    fillStrums.onClick = [this, fillRange] {
+        double from, to;
+        fillRange(from, to);
+        const int pattern = strumBox.getSelectedId() - 1;
+        const auto c = roll.currentChord();
+        roll.edit([=](Song& s) { s.fill_strums_range(from, to, pattern, c.frets, c.name, 2.0); });
+    };
+    fillArp.onClick = [this, fillRange] {
+        double from, to;
+        fillRange(from, to);
+        const int pattern = arpBox.getSelectedId() - 1;
+        const auto c = roll.currentChord();
+        roll.edit([=](Song& s) { s.fill_arpeggio_range(from, to, pattern, c.frets, 2.0); });
     };
     clearBar.onClick = [this] {
         const int bar = roll.currentBar;
@@ -326,7 +357,7 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
     chordLabel.setText("Chord", juce::dontSendNotification);
     snapLabel.setText("Snap", juce::dontSendNotification);
     songLabel.setText("Length", juce::dontSendNotification);
-    for (auto* c : std::initializer_list<juce::Component*> {&chordBox, &strumBox, &arpBox, &snapBox, &barsBox, &fillCount,
+    for (auto* c : std::initializer_list<juce::Component*> {&rootBox, &qualityBox, &keyBox, &scaleBox, &keyLabel, &strumBox, &arpBox, &snapBox, &barsBox, &fillCount,
                                                              &fillStrums, &fillArp, &clearBar, &undoButton, &redoButton,
                                                              &demoButton, &chordLabel, &barLabel, &snapLabel, &songLabel, &help})
         addAndMakeVisible(c);
@@ -336,7 +367,8 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
     }
     help.setText("Click: new note / select.  Ctrl+click: add to selection.  Ctrl/Shift+drag: rectangle.  Ctrl+drag a note: "
                  "copy.  Ctrl+A/C/X/V/D: all, copy, cut, paste, duplicate.  Arrows: move (Shift: bar, Shift+up/down: string).  "
-                 "Wheel or digits: fret.  P: palm.  Del: delete.  Ctrl+wheel: zoom.  Space: play.",
+                 "Wheel or digits: fret.  +/-: transpose.  P: palm.  X: dead note.  Alt+click: hand stop.  Drag a note's top or bottom "
+                 "edge: more strings.  Del: delete.  Ctrl+wheel: zoom.  Space: play.",
                  juce::dontSendNotification);
     help.setFont(font(11.0f));
     // ---------------------------------------------------------------- patterns
@@ -386,6 +418,8 @@ GRMGuitarEditor::GRMGuitarEditor(GRMGuitarProcessor& p)
 GRMGuitarEditor::~GRMGuitarEditor() { setLookAndFeel(nullptr); }
 
 void GRMGuitarEditor::refreshTools() {
+    keyBox.setSelectedId(roll.getSong().key + 1, juce::dontSendNotification);
+    scaleBox.setSelectedId(roll.getSong().scale + 1, juce::dontSendNotification);
     const int bars = roll.getSong().bars;
     if (barsBox.indexOfItemId(bars) < 0) barsBox.addItem(juce::String(bars) + " bars", bars);   // grown by writing
     barsBox.setSelectedId(bars, juce::dontSendNotification);
@@ -421,9 +455,9 @@ void GRMGuitarEditor::rebuildGuitars() {
     addTab("Body", {"hollow", "wood", "density_pct", "body_size", "top_mm", "braces_g", "body_q", "coupling", "body_amount", "sympathy"});
     addTab("Sensor", {"sensor", "pickup_mm", "pickup_type", "cable_pf"});
     addTab("Room", {"room_on", "room_size", "room_material", "room_distance"});
-    addTab("Player", {"human", "swing_cm", "finger_noises", "finger_force"});
+    addTab("Player", {"human", "human_amount", "swing_cm", "finger_noises", "finger_force"});
     tabs.addTab("Mixer", PANEL, new MixerView(processor), true);
-    addTab("Playback", {"follow_host", "loop", "tempo", "midi_strings", "midi_route"}, false);
+    addTab("Playback", {"follow_host", "loop", "tempo", "midi_strings", "midi_route", "audition"}, false);
     tabs.addTab("Networks", PANEL, new NetworksView(processor), true);
     tabs.setCurrentTabIndex(juce::jmin(shownTab, tabs.getNumTabs() - 1), false);
     resized();
@@ -555,7 +589,11 @@ void GRMGuitarEditor::timerCallback() {
         const double beat = b - bar * s.beats_per_bar;
         const juce::String where = playing == processor.getEditingPattern() ? juce::String(bar + 1) + "." + juce::String((int) beat + 1)
                                                                              : juce::String("P") + juce::String(playing + 1);
-        position.setText(where + (host ? "  (host)" : ""), juce::dontSendNotification);
+        // and where the whole song is (the patterns may have other lengths): bar.beat from its start
+        juce::String song;
+        const double g = processor.getSongBeat();
+        if (g >= 0) song = "   song " + juce::String((int) (g / s.beats_per_bar) + 1) + "." + juce::String((int) std::fmod(g, s.beats_per_bar) + 1);
+        position.setText(where + song + (host ? "  (host)" : ""), juce::dontSendNotification);
     } else {
         position.setText("-", juce::dontSendNotification);
     }
@@ -585,7 +623,7 @@ void GRMGuitarEditor::resized() {
     header.removeFromRight(6);
     exportButton.setBounds(header.removeFromRight(90));
     header.removeFromRight(10);
-    position.setBounds(header.removeFromRight(110));
+    position.setBounds(header.removeFromRight(200));
     header.removeFromRight(10);
     status.setBounds(header.removeFromRight(juce::jmin(260, juce::jmax(0, header.getWidth() - 150))));
     subtitleWidth = juce::jmax(0, header.getWidth() - 150);
@@ -616,9 +654,9 @@ void GRMGuitarEditor::resized() {
     snapLabel.setBounds(tools.removeFromLeft(36));
     snapBox.setBounds(tools.removeFromLeft(84));
     tools.removeFromLeft(14);
-    barLabel.setBounds(tools.removeFromLeft(52));
     chordLabel.setBounds(tools.removeFromLeft(42));
-    chordBox.setBounds(tools.removeFromLeft(80));
+    rootBox.setBounds(tools.removeFromLeft(76));
+    qualityBox.setBounds(tools.removeFromLeft(78));
     tools.removeFromLeft(4);
     strumBox.setBounds(tools.removeFromLeft(132));
     fillStrums.setBounds(tools.removeFromLeft(84));
@@ -648,7 +686,11 @@ void GRMGuitarEditor::resized() {
     copyPatternButton.setBounds(row.removeFromLeft(48));
     row.removeFromLeft(4);
     pastePatternButton.setBounds(row.removeFromLeft(50));
-    row.removeFromLeft(14);
+    row.removeFromLeft(12);
+    keyLabel.setBounds(row.removeFromLeft(28));
+    keyBox.setBounds(row.removeFromLeft(74));
+    scaleBox.setBounds(row.removeFromLeft(120));
+    row.removeFromLeft(12);
     midiLabel.setBounds(row.removeFromLeft(66));
     midiModeBox.setBounds(row.removeFromLeft(120));
     row.removeFromLeft(8);

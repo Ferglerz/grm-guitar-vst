@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "model.hpp"
+#include "ringing.hpp"
 #include "song.hpp"
 #include "voice.hpp"
 
@@ -46,11 +47,19 @@ struct Event {
 // how a note stops (s^-1, extra losses at the fundamental): a fretted note dies as the finger relaxes on it, an
 // open string waits for a hand to touch it (softer); a lifted finger leaves the string to the lift pluck
 constexpr double RELEASE_FRETTED = 32.0, RELEASE_OPEN = 14.0, RELEASE_LIFT = 45.0;
+// a hand laid flat on the strings: as fast as a finger leaving its fret (the flesh covers the strings at once)
+constexpr double RELEASE_HAND = 45.0;
+// a dead note: a finger rests on the string without pressing it (no measured value: a damping strong enough that
+// no pitch is left after a few periods of the low strings, and the delay of the pick leaving the string)
+constexpr double RELEASE_DEAD = 400.0, DEAD_TOUCH = 0.002;
 // a chord released: the fingers leave one after the other (s between strings, before the player's own spread)
 constexpr double RELEASE_SPREAD = 0.006;
 // the palm: its edge presses less (share of the pressure on the strings next to the ones asked); how much harder
 // it presses on a harder stroke (exponent of the stroke's force); how fast it stops a string it lands on (s^-1)
 constexpr double PALM_EDGE = 0.45, PALM_FORCE_FOLLOW = 0.3, PALM_LAND_DAMP = 50.0;
+// the damp of a string the palm lands on is given at its fundamental, and the engine adds more for the higher modes:
+// the palm network's fundamental damping times this spread covers the band its modes are damped over
+constexpr double PALM_LAND_SPREAD = 2.0;
 // the sweep: the mass that carries the pick across the strings (kg): the pick and the fingers holding it, the
 // arm behind a supple wrist; each string it pushes aside takes some of its energy
 constexpr double HAND_MASS = 0.04, SWEEP_LOSS_MAX = 0.6;
@@ -127,18 +136,22 @@ public:
         const double step = spb / 4.0;                   // a sixteenth: the half swing of the arm
         std::mt19937 rng(o.seed);
         std::normal_distribution<double> normal(0.0, 1.0);
-        auto jitter = [&](double sd) { return s.human ? sd * normal(rng) : 0.0; };
+        auto jitter = [&](double sd) { return s.human ? s.human_amount * sd * normal(rng) : 0.0; };
 
         // ---------------------------------------------------------------- 1) the strokes of the right hand
-        struct Strike { double beat; int string, fret; double velocity, length; bool palm, up; int strum; };
+        // how long each note and strum string rings (as long as the hands let it, see ringing.hpp)
+        const Ringing rings = ringing(song, perf->length_beats, o.loop);
+        struct Strike { double beat; int string, fret; double velocity, length; bool palm, up; int strum; double ring; int end; bool dead; };
         struct Moment { double beat; std::vector<Strike> strikes; int strum = -1; };
         std::map<long, Moment> moments;                  // by start, to the 1/960 beat
         auto key = [](double beat) { return std::lround(beat * 960.0); };
-        for (const auto& n : song.notes) {
+            for (size_t q = 0; q < song.notes.size(); ++q) {
+            const auto& n = song.notes[q];
             if (n.start >= perf->length_beats || n.fret < 0 || n.fret >= NUM_FRETS) continue;
             auto& mo = moments[key(n.start)];
             mo.beat = n.start;
-            mo.strikes.push_back({n.start, n.string, n.fret, n.velocity, n.length, n.palm, false, -1});
+            mo.strikes.push_back({n.start, n.string, n.dead ? 0 : n.fret, n.velocity, n.length, n.palm, false, -1,
+                                  rings.note_end[q] - n.start, n.end, n.dead});
         }
         for (size_t k = 0; k < song.strums.size(); ++k) {
             const auto& st = song.strums[k];
@@ -194,6 +207,9 @@ public:
                 return keep(*perf, palms.get(m, i, fret, stroke.palm_x, stroke.palm_N * press));
             };
             std::vector<bool> struck(NUM_STRINGS, false);
+            // a stroke the player starts before the song's start (no loop to take it from): it starts at 0, its
+            // strings keep their spacing in time instead of all landing on 0
+            const double early = (!o.loop && stroke.t < 0) ? -stroke.t : 0.0;
 
             // single notes struck together: with a pick, one sweep across them (in the arm's direction: down on
             // the sixteenths of the beat, up between); with the fingers, a pinch
@@ -211,13 +227,20 @@ public:
                 std::vector<int> frets;
                 for (auto* st : by_string) frets.push_back(st->fret);
                 const auto contacts = s.pick ? sweep(m, strings, base, frets, stroke, 0.0)
-                                             : pinch(strings, base, s.human ? &rng : nullptr);
+                                             : pinch(strings, base, s.human ? &rng : nullptr, s.human_amount);
                 for (size_t q = 0; q < contacts.size(); ++q) {
                     const auto* st = by_string[q];
-                    played.push_back({stroke.t + contacts[q].delay, st->string, st->fret, stroke.force * contacts[q].share, stroke.p,
-                                      st->length * spb, palm_for(st->string, st->fret), stroke, palm_share(st->string) > 0,
+                    played.push_back({stroke.t + early + contacts[q].delay, st->string, st->fret, stroke.force * contacts[q].share, stroke.p,
+                                      st->ring * spb, palm_for(st->string, st->fret), stroke, palm_share(st->string) > 0,
                                       contacts.size() > 1 ? (int) q : -1});
                     struck[(size_t) st->string] = true;
+                    // a dead note: the finger resting on the string damps it at once, the pick leaves a click
+                    if (st->dead) touches.push_back({stroke.t + early + contacts[q].delay + DEAD_TOUCH, st->string, RELEASE_DEAD});
+                    // a flat hand stops the note at its end, and the strings beside it
+                    if (st->end == RollNote::hand)
+                        for (int j = st->string - 1; j <= st->string + 1; ++j)
+                            if (j >= 0 && j < NUM_STRINGS)
+                                touches.push_back({stroke.t + early + contacts[q].delay + st->length * spb, j, RELEASE_HAND});
                 }
             }
             if (mo.strum >= 0) {
@@ -243,16 +266,20 @@ public:
                 const auto contacts = sweep(m, strings, base, frets, stroke, reach.front().delay);
                 for (size_t q = 0; q < contacts.size(); ++q) {
                     const int i = strings[q];
-                    played.push_back({stroke.t + contacts[q].delay, i, frets[q], stroke.force * contacts[q].share, stroke.p,
-                                      st.length * spb, palm_for(i, frets[q]), stroke, palm_share(i) > 0, (int) q});
+                    const double ring = rings.strum_end[(size_t) mo.strum][(size_t) i] - st.start;
+                    played.push_back({stroke.t + early + contacts[q].delay, i, frets[q], stroke.force * contacts[q].share, stroke.p,
+                                      std::max(ring, st.length) * spb, palm_for(i, frets[q]), stroke, palm_share(i) > 0, (int) q});
                     struck[(size_t) i] = true;
                 }
             }
             if (palm_here) {
                 palm_spans.push_back({stroke.t - 0.05, stroke.t + longest * spb});
-                for (int i = 0; i < NUM_STRINGS && palm_down; ++i)   // strings under the palm, ringing, not struck
+                // strings under the palm, ringing, not struck: the palm lands on them with its own damping (the
+                // palm network of that string at that pressure and place), not a fixed one
+                for (int i = 0; i < NUM_STRINGS && palm_down; ++i)
                     if (!struck[(size_t) i] && palm_share(i) > 0)
-                        touches.push_back({stroke.t - 0.03, i, PALM_LAND_DAMP * palm_share(i)});
+                        if (const Palm* pp = palm_for(i, 0))
+                            touches.push_back({stroke.t - 0.03, i, std::min(PALM_LAND_DAMP, pp->sigma_at(0) * PALM_LAND_SPREAD)});
             }
         }
         std::stable_sort(played.begin(), played.end(), [](const Played& a, const Played& b) { return a.t < b.t; });
@@ -351,6 +378,10 @@ public:
             // the last note: in a loop it ends before the string's first stroke of the next cycle
             settle(wrap ? mine.front().t + song_s - 0.1 : 1e300);
         }
+        // the hand stops of the song: a hand laid flat on every string
+        for (double t : song.stops)
+            if (t < perf->length_beats)
+                for (int i = 0; i < NUM_STRINGS; ++i) touches.push_back({t * spb, i, RELEASE_HAND});
         for (const auto& t : touches) add_damp(*perf, t.string, to_beat(t.t), false, t.extra);
         for (auto [a, b] : palm_spans) {
             Event on, off;
@@ -410,7 +441,8 @@ public:
     // fingers plucking together (a pinch): each finger its own force and timing; the thumb (the bass) a little
     // ahead of the others
     template <class Rng>
-    static std::vector<Contact> pinch(const std::vector<int>& strings, const std::vector<double>& base, Rng* rng) {
+    static std::vector<Contact> pinch(const std::vector<int>& strings, const std::vector<double>& base, Rng* rng,
+                                      double amount = 1.0) {
         std::vector<Contact> out;
         if (strings.empty()) return out;
         const int bass = *std::min_element(strings.begin(), strings.end());
@@ -420,8 +452,8 @@ public:
             double delay = thumb ? 0.0 : THUMB_LEAD * (strings.size() > 1);
             double share = base[j];
             if (rng) {
-                delay += std::abs(PINCH_SPREAD * normal(*rng));
-                share *= std::pow(10.0, PINCH_FORCE_SIGMA * normal(*rng));
+                delay += std::abs(amount * PINCH_SPREAD * normal(*rng));
+                share *= std::pow(10.0, amount * PINCH_FORCE_SIGMA * normal(*rng));
             }
             out.push_back({strings[j], delay, share});
         }
@@ -537,6 +569,7 @@ private:
                                           Rng& rng) {
         PlayerNoise noise;
         noise.exact = !s.human;
+        noise.amount = s.human_amount;
         noise.rng.seed(rng());
         std::vector<Stroke> out;
         const size_t window = 32;
