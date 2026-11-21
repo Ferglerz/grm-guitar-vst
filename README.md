@@ -6,7 +6,7 @@ pickups and the room. Several guitars in one plugin, a guitar roll that knows a 
 that refuse what no guitarist can play. Free software under the AGPL-3.0 (JUCE 8 is itself available under the
 AGPL-3.0).
 
-![GRM Guitar 0.3.0: two guitars, the second one with the first one's notes faint behind it](docs/screenshot.png)
+[![Watch the GRM Guitar demo on YouTube](https://img.youtube.com/vi/PHgxrdl3X0Q/maxresdefault.jpg)](https://www.youtube.com/watch?v=PHgxrdl3X0Q)
 
 ## The GRM family
 
