@@ -15,16 +15,16 @@ target_include_directories(grm_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/core)
 
 if(GRMG_BUILD_TESTS)
     enable_testing()
-    add_executable(test_core tests/test_core.cpp)
+    add_executable(test_core tests/test_core.cpp )
     target_link_libraries(test_core PRIVATE grm_core)
     add_test(NAME grm_core_matches_python COMMAND test_core)
-    add_executable(test_physics tests/test_physics.cpp)
+    add_executable(test_physics tests/test_physics.cpp )
     target_link_libraries(test_physics PRIVATE grm_core)
     add_test(NAME guitar_physics_matches_python COMMAND test_physics)
-    add_executable(test_play tests/test_play.cpp)
+    add_executable(test_play tests/test_play.cpp )
     target_link_libraries(test_play PRIVATE grm_core)
     add_test(NAME guitar_playing COMMAND test_play)
-    add_executable(render_offline tests/render_offline.cpp)
+    add_executable(render_offline tests/render_offline.cpp )
     target_link_libraries(render_offline PRIVATE grm_core)
 endif()
 
@@ -58,7 +58,7 @@ if(GRMG_BUILD_PLUGIN)
         plugin/PluginProcessor.cpp
         plugin/GuitarTrack.cpp
         plugin/PluginEditor.cpp
-        plugin/RollView.cpp)
+        plugin/RollView.cpp )
 
     target_compile_definitions(GRMGuitar PUBLIC
         JUCE_WEB_BROWSER=0
@@ -79,13 +79,13 @@ if(GRMG_BUILD_PLUGIN)
 
     if(GRMG_BUILD_TESTS)
         # the plugin's own code, called as a host would, without a host
-        add_executable(plugin_host_test tests/plugin_host_test.cpp)
+        add_executable(plugin_host_test tests/plugin_host_test.cpp )
         target_link_libraries(plugin_host_test PRIVATE GRMGuitar juce::juce_audio_formats juce::juce_recommended_config_flags)
         target_compile_definitions(plugin_host_test PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
-        add_executable(plugin_cpu_test tests/plugin_cpu_test.cpp)
+        add_executable(plugin_cpu_test tests/plugin_cpu_test.cpp )
         target_link_libraries(plugin_cpu_test PRIVATE GRMGuitar juce::juce_audio_formats juce::juce_recommended_config_flags)
         target_compile_definitions(plugin_cpu_test PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
-        add_executable(editor_snapshot tests/editor_snapshot.cpp)
+        add_executable(editor_snapshot tests/editor_snapshot.cpp )
         target_link_libraries(editor_snapshot PRIVATE GRMGuitar juce::juce_audio_formats juce::juce_recommended_config_flags)
         target_compile_definitions(editor_snapshot PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
     endif()
